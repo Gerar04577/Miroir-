@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<!-- Miroir OneDrive -> Google Drive — index.html — VERSION 1.2 -->
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Miroir">
+<meta name="theme-color" content="#14213d">
+<link rel="manifest" href="manifest.json?v=1.1">
+<link rel="apple-touch-icon" href="icon-180.png?v=1.1">
+<title>Miroir OneDrive → Google</title>
+<style>
+  :root { --bg:#f3f4f7; --card:#fff; --ink:#14213d; --mut:#6b7280; --acc:#1f6feb; --ok:#1a7f37; --err:#c62828; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--ink);
+         padding: calc(env(safe-area-inset-top) + 12px) 14px calc(env(safe-area-inset-bottom) + 24px); }
+  header { display:flex; align-items:baseline; justify-content:space-between; margin:4px 2px 12px; }
+  h1 { font-size:21px; margin:0; }
+  #ver { font-size:12px; color:var(--mut); }
+  .card { background:var(--card); border-radius:14px; padding:14px; margin-bottom:12px; box-shadow:0 1px 3px rgba(0,0,0,.06); }
+  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.05em; color:var(--mut); margin:0 0 10px; }
+  .line { display:flex; justify-content:space-between; align-items:center; gap:10px; margin:6px 0; }
+  .muted { color:var(--mut); font-size:14px; }
+  .err { color:var(--err); }
+  button { font:inherit; border:0; border-radius:10px; padding:10px 14px; background:#e8eefc; color:var(--acc); font-weight:600; }
+  button:disabled { opacity:.45; }
+  button.big { width:100%; padding:15px; font-size:17px; margin-top:8px; }
+  button.main { background:var(--acc); color:#fff; }
+  button.stop { background:#fde8e8; color:var(--err); }
+  .path { font-weight:600; word-break:break-word; }
+  .bar { height:10px; background:#e5e7eb; border-radius:6px; overflow:hidden; margin:10px 0 6px; }
+  #pBar { height:100%; width:0; background:var(--acc); transition:width .3s; }
+  #pCur { white-space:pre-wrap; font-size:13px; color:var(--mut); max-height:70px; overflow:hidden; }
+  #summary { white-space:pre-wrap; font-size:15px; background:#f7f9fc; padding:10px; border-radius:10px; margin-top:8px; }
+  #log { font:12px/1.45 ui-monospace, Menlo, monospace; max-height:240px; overflow:auto; white-space:pre-wrap; }
+  details summary { font-weight:600; padding:4px 0; }
+  label { display:block; font-size:14px; margin:10px 0 4px; }
+  input[type=text] { width:100%; font:14px ui-monospace, Menlo, monospace; padding:9px; border:1px solid #d1d5db; border-radius:8px; }
+  .radio { display:flex; gap:8px; align-items:flex-start; margin:8px 0; font-size:15px; }
+  .radio input { margin-top:4px; }
+  code { font-size:13px; word-break:break-all; background:#f1f3f6; padding:2px 4px; border-radius:4px; }
+  .modal { position:fixed; inset:0; background:rgba(0,0,0,.45); display:flex; align-items:flex-end; z-index:10; }
+  .modal[hidden] { display:none; }
+  .sheet { background:#fff; width:100%; max-height:85vh; border-radius:16px 16px 0 0; padding:16px 14px calc(env(safe-area-inset-bottom) + 16px); display:flex; flex-direction:column; }
+  #pickList { overflow:auto; flex:1; margin:10px 0; }
+  .row { display:block; width:100%; text-align:left; background:#f7f9fc; color:var(--ink); font-weight:500; margin:5px 0; }
+  .btns { display:flex; gap:8px; }
+  .btns button { flex:1; }
+  #cText { white-space:pre-wrap; font-size:15px; }
+  .warn { background:#fff4e5; color:#8a4b00; padding:10px; border-radius:10px; margin:10px 0; }
+  .note { background:#eef6ee; color:#1a5c2a; padding:10px; border-radius:10px; font-size:14px; }
+</style>
+</head>
+<body>
+<header><h1>Miroir OneDrive → Google</h1><span id="ver"></span></header>
+
+<div class="card note">OneDrive est seulement <b>lu</b>, jamais modifié. Seule la copie dans Google est corrigée pour être exactement le miroir de OneDrive.</div>
+
+<div class="card">
+  <h2>Connexions</h2>
+  <div class="line"><div>Microsoft (OneDrive)<div class="muted" id="msState"></div></div><button id="btnMs">Connecter</button></div>
+  <div class="line"><div>Google Drive<div class="muted" id="gState"></div></div><button id="btnG">Connecter</button></div>
+  <div class="muted" id="gQuota"></div>
+  <div id="gNeed" class="warn" hidden>Google demande une reconnexion. <button id="gNeedBtn">Reconnecter et reprendre</button></div>
+</div>
+
+<div class="card">
+  <h2>Dossier OneDrive à recopier</h2>
+  <div class="path" id="srcPath"></div>
+  <button id="btnPick" style="margin-top:8px">Choisir le dossier</button>
+  <h2 style="margin-top:14px">Copie dans Google</h2>
+  <div class="path" id="dstPath"></div>
+</div>
+
+<div class="card">
+  <h2>Synchronisation</h2>
+  <div class="muted" id="lastRun"></div>
+  <button class="big main" id="btnRun">Lancer la copie</button>
+  <button class="big" id="btnDry">Analyser seulement (rien n'est écrit)</button>
+  <button class="big stop" id="btnStop" hidden>Arrêter</button>
+  <div id="progress" hidden>
+    <div class="bar"><div id="pBar"></div></div>
+    <div id="pText"></div>
+    <div id="pCur"></div>
+  </div>
+  <div id="summary" hidden></div>
+  <p class="muted">Pendant la copie, gardez l'app ouverte et l'écran allumé. Si elle est interrompue, relancez : elle reprend où elle s'était arrêtée.</p>
+</div>
+
+<div class="card">
+  <details>
+    <summary>Réglages</summary>
+    <div class="muted" style="margin-top:8px">Ce qui disparaît de OneDrive (ou ce qui est en trop dans Google) est retiré de la copie Google :</div>
+    <label class="radio"><input type="radio" name="delMode" value="trash"> <span>Corbeille Google (récupérable 30 jours) — <b>miroir exact</b></span></label>
+    <label class="radio"><input type="radio" name="delMode" value="archive"> <span>Rangé dans « Miroir OneDrive › _Supprimés › date » (conservé sans limite)</span></label>
+    <label for="msClient">Identifiant d'application Microsoft (Entra)</label>
+    <input type="text" id="msClient" autocomplete="off" spellcheck="false">
+    <label for="gClient">Identifiant client Google (…apps.googleusercontent.com)</label>
+    <input type="text" id="gClient" autocomplete="off" spellcheck="false">
+    <button id="btnSave" style="margin-top:10px">Enregistrer les réglages</button>
+    <label>Adresse de redirection à déclarer chez Microsoft et chez Google</label>
+    <code id="redirect"></code> <button id="btnCopy">Copier</button>
+    <div style="margin-top:14px"><button id="btnLogout" class="stop">Oublier les connexions</button></div>
+  </details>
+</div>
+
+<div class="card">
+  <details>
+    <summary>Journal</summary>
+    <div id="log"></div>
+  </details>
+</div>
+
+<div class="modal" id="picker" hidden>
+  <div class="sheet">
+    <div class="muted" id="pickPath"></div>
+    <div id="pickList"></div>
+    <div class="btns">
+      <button id="pickBack">‹ Retour</button>
+      <button id="pickChoose" class="main">Choisir ce dossier</button>
+    </div>
+    <button id="pickClose" style="margin-top:8px">Fermer</button>
+  </div>
+</div>
+
+<div class="modal" id="confirmBox" hidden>
+  <div class="sheet">
+    <h2 style="margin:0 0 8px">Ce qui va être fait dans Google</h2>
+    <div id="cText"></div>
+    <div id="cWarn" class="warn" hidden></div>
+    <div class="btns" style="margin-top:12px">
+      <button id="cNo">Annuler</button>
+      <button id="cGo" class="main">Lancer</button>
+    </div>
+  </div>
+</div>
+
+<script src="engine.js?v=1.1"></script>
+<script src="app.js?v=1.2"></script>
+</body>
+</html>

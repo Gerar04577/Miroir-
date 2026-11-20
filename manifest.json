@@ -1,0 +1,14 @@
+{
+  "name": "Miroir OneDrive → Google",
+  "short_name": "Miroir",
+  "version": "1.1",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f3f4f7",
+  "theme_color": "#14213d",
+  "icons": [
+    { "src": "icon-180.png?v=1.1", "sizes": "180x180", "type": "image/png" },
+    { "src": "icon-512.png?v=1.1", "sizes": "512x512", "type": "image/png" }
+  ]
+}
