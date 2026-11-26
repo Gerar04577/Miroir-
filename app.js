@@ -1,9 +1,9 @@
 /* Miroir OneDrive -> Google Drive — interface et connexions
- * Fichier : app.js — VERSION 1.2
+ * Fichier : app.js — VERSION 1.3
  */
 (function () {
   'use strict';
-  const APP_VERSION = '1.2';
+  const APP_VERSION = '1.3';
   const DEFAULT_MS_CLIENT = ''; // inscription Entra DÉDIÉE « Miroir », avec la seule permission Files.Read : Microsoft refuse alors toute écriture dans OneDrive
   const MS_AUTH = 'https://login.microsoftonline.com/consumers/oauth2/v2.0';
   const MS_SCOPE = 'Files.Read offline_access';
@@ -20,6 +20,12 @@
 
   let cfg = Object.assign({ msClient: DEFAULT_MS_CLIENT, gClient: '', source: null, delMode: 'trash' }, get(LS.cfg, {}));
   const saveCfg = () => set(LS.cfg, cfg);
+  // Identité de cet appareil (garde-fou : deux appareils ne copient jamais en même temps)
+  const ua = navigator.userAgent || '';
+  const DEVICE = {
+    id: get('miroir.dev', null) || (() => { const v = 'D' + Math.random().toString(36).slice(2, 10); set('miroir.dev', v); return v; })(),
+    label: /iPhone/.test(ua) ? 'iPhone' : (/iPad/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1)) ? 'iPad' : 'Ordinateur'
+  };
   let engine = null, running = false, wakeLock = null;
 
   /* ---------------- Journal ---------------- */
@@ -234,6 +240,7 @@
       `\nCopie Google à corriger (manquant, altéré, déplacé à la main) : ${c.reparesGoogle || 0}` +
       `\nEn trop dans Google (absent de OneDrive) : ${c.enTropDansGoogle || 0}` +
       ((c.supprimes || c.enTropDansGoogle) ? (cfg.delMode === 'trash' ? ' → corbeille Google' : ' → _Supprimés') : '') +
+      (c.reprisDansIndex ? `\nDéjà copiés, repris dans la liste : ${c.reprisDansIndex}` : '') +
       `\nVolume à copier : ${fmtBytes(p.bytes)}\n\nOneDrive n'est jamais modifié.`;
   }
   function askConfirm(p) {
@@ -255,7 +262,7 @@
     running = true; render();
     $('progress').hidden = false; $('pBar').style.width = '2%'; $('pCur').textContent = '';
     if (!dryRun) await keepAwake(true);
-    engine = MiroirEngine.createEngine({ fetch: (u, o) => fetch(u, o), xhrPut, msToken, gToken, gTokenQuiet, log, progress, journal });
+    engine = MiroirEngine.createEngine({ fetch: (u, o) => fetch(u, o), xhrPut, msToken, gToken, gTokenQuiet, log, progress, journal, device: DEVICE });
     log(dryRun ? '— Analyse —' : (auto ? '— Reprise automatique —' : '— Copie —'));
     let res;
     try {
@@ -287,6 +294,10 @@
       if (Date.now() - last > 120000) { localStorage.setItem(LS.lastRenew, String(Date.now())); gLogin(true); }
       else { $('gNeed').hidden = false; $('pText').textContent = 'En pause : reconnectez Google pour reprendre.'; }
       render(); return;
+    }
+    if (res.paused === 'autre-appareil') {
+      $('pText').textContent = `⛔ ${res.lock.label || 'Un autre appareil'} a copié ce dossier il y a ${res.lock.minutes} min. Arrêtez-le, ou attendez 10 minutes après sa dernière activité, puis relancez.`;
+      $('pBar').style.width = '0'; render(); return;
     }
     const sec = res.seconds || 0;
     const msg = res.paused === 'stop' ? '⏸ Arrêté. Relancez pour continuer là où la copie s\'est arrêtée.'

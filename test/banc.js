@@ -121,7 +121,7 @@ function makeWorld() {
         const folderOnly = /mimeType=/.test(qs);
         const all = [...gd.files.values()].filter((f) => !f.trashed && (name === null || f.name === name) && f.parents.includes(parent) && (!folderOnly || f.folder));
         const ps = 4, start = Number(u.searchParams.get('pageToken') || 0);   // petite pagination pour tester nextPageToken
-        const files = all.slice(start, start + ps).map((f) => ({ id: f.id, name: f.name, mimeType: f.folder ? 'application/vnd.google-apps.folder' : 'application/octet-stream', size: f.folder ? undefined : String((f.content || '').length), sha1Checksum: f.folder ? undefined : sha1(f.content || '') }));
+        const files = all.slice(start, start + ps).map((f) => ({ id: f.id, name: f.name, mimeType: f.folder ? 'application/vnd.google-apps.folder' : 'application/octet-stream', size: f.folder ? undefined : String((f.content || '').length), sha1Checksum: f.folder ? undefined : sha1(f.content || ''), appProperties: f.appProperties }));
         const body = { files };
         if (start + ps < all.length) body.nextPageToken = String(start + ps);
         return resp(200, body);
@@ -157,7 +157,7 @@ function makeWorld() {
           const meta = JSON.parse(parts[1].split('\r\n\r\n')[1].trim());
           const content = parts[2].split('\r\n\r\n').slice(1).join('\r\n\r\n').replace(/\r\n$/, '');
           if (meta.name.startsWith('_index-') && world.crashOnIndexSave && ++world.indexSaves > world.crashAfter) throw new Error('CRASH simulé');
-          gd.uploadsCount++;
+          if (!meta.name.startsWith('_index-')) gd.uploadsCount++;
           return resp(200, { id: gd.create(meta, content) });
         }
         if (type === 'resumable') {
@@ -174,7 +174,7 @@ function makeWorld() {
         const type = u.searchParams.get('uploadType');
         if (type === 'media') {
           if (f.name.startsWith('_index-') && world.crashOnIndexSave && ++world.indexSaves > world.crashAfter) throw new Error('CRASH simulé');
-          f.content = await bodyText(opt.body); gd.uploadsCount++; return resp(200, { id: f.id });
+          f.content = await bodyText(opt.body); if (!f.name.startsWith('_index-')) gd.uploadsCount++; return resp(200, { id: f.id });
         }
         if (type === 'resumable') {
           const sid = 'S' + (++gd.n);
@@ -272,7 +272,7 @@ function buildTree(od) {
   r = await W.engine().run(src, {});
   const c = r.plan.counts;
   ok(c.nouveauxFichiers === 0 && c.modifies === 0 && c.deplaces === 0 && c.supprimes === 0 && c.nouveauxDossiers === 0, 'plan vide');
-  ok(W.gd.uploadsCount === before + 1, 'aucun fichier renvoyé (seul l\'index est réécrit)');
+  ok(W.gd.uploadsCount === before, 'aucun fichier renvoyé (seul l\'index est réécrit)');
 
   console.log('\n3) Modifs, renommages, déplacements, ajouts, suppressions');
   W.od.setContent('BAIL', 'bail v2 avenant');
@@ -326,14 +326,14 @@ function buildTree(od) {
   ok(roots.length === 1, 'un seul dossier miroir créé malgré le plantage initial');
   sameTree(W, src, mirrorRoot(W), 'après plantage initial');
   W = makeWorld(); buildTree(W.od);
-  W.crashOnIndexSave = true; W.crashAfter = 1;          // plantage à l'enregistrement final
+  W.crashOnIndexSave = true; W.crashAfter = 2;          // plantage à l'enregistrement final (1 = création, 2 = prise de main)
   r = await W.engine().run(src, {}).catch((e) => ({ crashed: e }));
   ok(W.journalStore.size === 1, 'journal local conservé après plantage');
   W.crashOnIndexSave = false;
   const up = W.gd.uploadsCount;
   r = await W.engine().run(src, {});
   ok(r.plan.counts.nouveauxFichiers === 0, 'rien à renvoyer après reprise du journal');
-  ok(W.gd.uploadsCount === up + 2, 'aucun doublon envoyé (seulement 2 écritures de l\'index)');
+  ok(W.gd.uploadsCount === up, 'aucun doublon envoyé');
   sameTree(W, src, mirrorRoot(W), 'après plantage');
 
   console.log('\n7) Mode « corbeille Google »');
@@ -408,6 +408,46 @@ function buildTree(od) {
   ok(r.failed.length === 0, 'secours utilisé sans erreur');
   sameTree(W, src, mirrorRoot(W), 'après téléchargement de secours');
   W.contentBroken = false;
+
+  console.log('\n15) Copie interrompue sur l\'iPhone, reprise sur l\'iPad');
+  W = makeWorld(); buildTree(W.od);
+  let clock = 1e12;
+  const iphone = { load: (id) => JSON.parse(W.journalStore.get(id) || '[]'), add: (id, e) => { const a = JSON.parse(W.journalStore.get(id) || '[]'); a.push(e); W.journalStore.set(id, JSON.stringify(a)); }, clear: (id) => W.journalStore.delete(id) };
+  const ipadStore = new Map();
+  const ipad = { load: (id) => JSON.parse(ipadStore.get(id) || '[]'), add: (id, e) => { const a = JSON.parse(ipadStore.get(id) || '[]'); a.push(e); ipadStore.set(id, JSON.stringify(a)); }, clear: (id) => ipadStore.delete(id) };
+  W.crashOnIndexSave = true; W.crashAfter = 2;                 // l'iPhone copie tout, puis s'arrête avant d'enregistrer l'index
+  await W.engine({ journal: iphone, device: { id: 'IPH', label: 'iPhone' }, now: () => clock }).run(src, {}).catch(() => {});
+  W.crashOnIndexSave = false;
+  ok(W.journalStore.size === 1, 'les opérations de l\'iPhone sont restées dans sa mémoire');
+  clock += 2 * 60000;
+  r = await W.engine({ journal: ipad, device: { id: 'IPD', label: 'iPad' }, now: () => clock }).run(src, {});
+  ok(r.paused === 'autre-appareil' && r.lock.label === 'iPhone', 'iPad refuse de démarrer : l\'iPhone a copié il y a 2 min');
+  clock += 11 * 60000;
+  const upB = W.gd.uploadsCount;
+  r = await W.engine({ journal: ipad, device: { id: 'IPD', label: 'iPad' }, now: () => clock }).run(src, {});
+  ok(!r.paused && r.failed.length === 0, 'iPad démarre une fois le délai passé');
+  ok(r.plan.counts.enTropDansGoogle === 0, 'aucun fichier de l\'iPhone pris pour un intrus');
+  ok(r.plan.counts.reprisDansIndex > 0 && r.plan.counts.nouveauxFichiers === 0 && r.plan.counts.nouveauxDossiers === 0, 'fichiers et dossiers repris dans l\'index (' + r.plan.counts.reprisDansIndex + '), rien à recopier');
+  ok(W.gd.uploadsCount === upB, 'aucun fichier renvoyé');
+  ok([...W.gd.files.values()].every((f) => !f.trashed), 'rien mis à la corbeille');
+  sameTree(W, src, mirrorRoot(W), 'après reprise sur l\'iPad');
+
+  console.log('\n16) Fichiers copiés par la v1.4 (sans version notée) → contenu renvoyé une fois, sans corbeille');
+  const ids = new Map([...W.gd.files.values()].filter((f) => !f.folder && f.appProperties).map((f) => [f.id, f.name]));
+  for (const f of W.gd.files.values()) if (f.appProperties) delete f.appProperties.t;
+  // l'index perd ces fichiers (comme une copie interrompue)
+  const st = W.engine({ journal: ipad, device: { id: 'IPD', label: 'iPad' }, now: () => clock });
+  const idxFile = [...W.gd.files.values()].find((f) => f.name.startsWith('_index-'));
+  const idx = JSON.parse(idxFile.content);
+  for (const [k, v] of Object.entries(idx.items)) if (!v.f) delete idx.items[k];
+  idxFile.content = JSON.stringify(idx);
+  r = await st.run(src, {});
+  ok(r.plan.counts.enTropDansGoogle === 0 && r.plan.counts.nouveauxFichiers === 0, 'repris, pas d\'intrus, pas de nouveau fichier');
+  ok(r.plan.counts.modifies === ids.size, 'contenu renvoyé une fois par sécurité (' + r.plan.counts.modifies + ')');
+  ok([...ids.keys()].every((id) => W.gd.files.has(id) && !W.gd.files.get(id).trashed), 'mêmes fichiers Google conservés, rien à la corbeille');
+  sameTree(W, src, mirrorRoot(W), 'après reprise des fichiers v1.4');
+  r = await st.run(src, {});
+  ok(r.plan.fileOps.length === 0 && r.plan.counts.enTropDansGoogle === 0, 'passage suivant : plus rien à faire');
 
   console.log(`\n✅ ${checks} contrôles réussis`);
 })().catch((e) => { console.error('\n❌ ÉCHEC :', e); process.exit(1); });

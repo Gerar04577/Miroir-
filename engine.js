@@ -1,5 +1,5 @@
 /* Miroir OneDrive -> Google Drive — moteur de synchronisation
- * Fichier : engine.js — VERSION 1.4
+ * Fichier : engine.js — VERSION 1.5
  * Sens unique : OneDrive (LECTURE SEULE, jamais aucune écriture ni suppression) -> Google Drive.
  * À chaque passage, le miroir Google est relu et remis exactement à l'image de OneDrive.
  * Aucune dépendance externe. Testable hors navigateur (fetch / xhrPut injectés).
@@ -7,7 +7,7 @@
 (function (root) {
   'use strict';
 
-  const ENGINE_VERSION = '1.4';
+  const ENGINE_VERSION = '1.5';
   const GRAPH = 'https://graph.microsoft.com/v1.0';
   const GD = 'https://www.googleapis.com/drive/v3';
   const GU = 'https://www.googleapis.com/upload/drive/v3';
@@ -20,6 +20,7 @@
   const TRANSFER_PARALLEL = 3;
   const SAVE_EVERY_OPS = 300;   // l'index d'« Immobilier » pèse ~3 Mo : le réécrire tous les 25 fichiers enverrait ~2 Go inutiles
   const SAVE_EVERY_MS = 180000;
+  const LOCK_MS = 10 * 60000;                             // un autre appareil actif il y a moins de 10 min = refus
 
   class PauseError extends Error {
     constructor(reason) { super('pause:' + reason); this.pause = reason; }
@@ -45,6 +46,7 @@
     const sleep = env.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
     const now = env.now || (() => Date.now());
     let stopRequested = false;
+    const myDevId = (env.device && env.device.id) || 'inconnu';
 
     async function safeText(r) { try { return await r.text(); } catch (e) { return ''; } }
 
@@ -102,10 +104,12 @@
       const j = await drive(GD + '/files?pageSize=10&fields=files(id,name)&q=' + encodeURIComponent(query));
       return (j.files && j.files[0]) ? j.files[0].id : null;
     }
-    async function gMkdir(name, parentId) {
+    async function gMkdir(name, parentId, odId) {
+      const meta = { name, mimeType: FOLDER_MIME, parents: [parentId] };
+      if (odId) meta.appProperties = { od: odId };   // permet de reconnaître ce dossier comme le sien
       const j = await drive(GD + '/files?fields=id', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, mimeType: FOLDER_MIME, parents: [parentId] })
+        body: JSON.stringify(meta)
       });
       return j.id;
     }
@@ -208,12 +212,12 @@
       async function listOne(fid) {
         let token = null;
         do {
-          const url = GD + '/files?pageSize=1000&fields=nextPageToken,files(id,name,mimeType,size,sha1Checksum)&q=' +
+          const url = GD + '/files?pageSize=1000&fields=nextPageToken,files(id,name,mimeType,size,sha1Checksum,appProperties)&q=' +
             encodeURIComponent(`'${q(fid)}' in parents and trashed=false`) + (token ? '&pageToken=' + encodeURIComponent(token) : '');
           const j = await drive(url);
           for (const f of j.files || []) {
             const folder = f.mimeType === FOLDER_MIME;
-            nodes.set(f.id, { id: f.id, name: f.name, folder, size: f.size != null ? Number(f.size) : null, sha1: String(f.sha1Checksum || '').toLowerCase(), parent: fid });
+            nodes.set(f.id, { id: f.id, name: f.name, folder, size: f.size != null ? Number(f.size) : null, sha1: String(f.sha1Checksum || '').toLowerCase(), parent: fid, ap: f.appProperties || {} });
             if (folder) queue.push(f.id);
           }
           token = j.nextPageToken || null;
@@ -258,7 +262,27 @@
           if (diff) { ex.t = '__verif__'; fix.contenuDifferent++; }
         }
       }
-      const mapped = new Set(Object.values(index.items).map((e) => e.g));
+      // Reprise des éléments que Miroir a lui-même copiés mais qui manquent à l'index
+      // (ex. copie interrompue sur un autre appareil) : reconnus par l'identifiant OneDrive inscrit dessus.
+      fix.adoptes = 0;
+      const mappedNow = new Set(Object.values(index.items).map((e) => e.g));
+      for (const node of gt.nodes.values()) {              // ordre de lecture : un dossier avant son contenu
+        if (mappedNow.has(node.id)) continue;
+        const od = node.ap && node.ap.od;
+        const it = od && walkById.get(od);
+        if (!it || index.items[od] || it.folder !== node.folder) continue;
+        const parentOd = node.parent === index.rootG ? source.id : g2od.get(node.parent);
+        if (parentOd === undefined) continue;
+        if (node.folder) {
+          index.items[od] = { g: node.id, p: parentOd, n: node.name, f: 1 };
+        } else {
+          // version de l'original connue et identique → rien à renvoyer ; sinon le contenu sera renvoyé une fois
+          const sameVersion = node.ap.t && node.ap.t === String(it.tag).slice(0, 100) && node.size === it.size;
+          index.items[od] = { g: node.id, p: parentOd, n: node.name, f: 0, t: sameVersion ? it.tag : '__repris__', s: node.size, h: node.sha1 };
+        }
+        g2od.set(node.id, od); mappedNow.add(node.id); fix.adoptes++;
+      }
+      const mapped = mappedNow;
       const extra = [...gt.nodes.values()].filter((n) => !mapped.has(n.id));
       const extraSet = new Set(extra.map((n) => n.id));
       const topExtras = extra.filter((n) => !extraSet.has(n.parent)).map((n) => n.id);
@@ -353,7 +377,8 @@
     let saveChain = Promise.resolve();
     function saveIndex(index, source) {
       saveChain = saveChain.catch(() => {}).then(async () => {
-        const data = JSON.stringify({ v: 1, sourceId: index.sourceId, sourceName: source.name, rootG: index.rootG, binG: index.binG, savedAt: new Date(now()).toISOString(), items: index.items });
+        if (index.lock && index.lock.dev === myDevId) index.lock.at = index.lock.done ? 0 : now();   // ne touche jamais au verrou d'un autre appareil
+        const data = JSON.stringify({ v: 1, sourceId: index.sourceId, sourceName: source.name, rootG: index.rootG, binG: index.binG, lock: index.lock || null, savedAt: new Date(now()).toISOString(), items: index.items });
         const blob = new Blob([data], { type: 'application/json' });
         if (index.fileG) {
           await drive(GU + '/files/' + encodeURIComponent(index.fileG) + '?uploadType=media&fields=id', {
@@ -458,6 +483,14 @@
       let index;
       try { index = await loadIndex(source); }
       catch (e) { if (e instanceof PauseError) { res.paused = e.pause; return res; } throw e; }
+      // Garde-fou : un autre appareil a-t-il copié ce dossier il y a moins de 10 minutes ?
+      const dev = env.device || { id: 'inconnu', label: 'cet appareil' };
+      if (index.lock && index.lock.dev !== dev.id && now() - index.lock.at < LOCK_MS) {
+        res.paused = 'autre-appareil';
+        res.lock = { label: index.lock.label, minutes: Math.round((now() - index.lock.at) / 60000) };
+        log('⛔ ' + (index.lock.label || 'Un autre appareil') + ' a copié ce dossier il y a ' + res.lock.minutes + ' min : arrêt par sécurité.');
+        return res;
+      }
       let ver = { fix: { manquants: 0, deplacesGoogle: 0, contenuDifferent: 0 }, extras: [], extrasCount: 0 };
       log('Vérification de la copie Google…');
       try {
@@ -472,10 +505,13 @@
       p.extras = (w.complete && res.verifyComplete) ? ver.extras : [];
       p.counts.enTropDansGoogle = p.extras.length ? ver.extrasCount : 0;
       p.counts.reparesGoogle = ver.fix.manquants + ver.fix.deplacesGoogle + ver.fix.contenuDifferent;
+      p.counts.reprisDansIndex = ver.fix.adoptes || 0;
       res.plan = p;
       if (!w.complete) log('⚠️ Lecture incomplète : AUCUNE suppression ne sera reportée cette fois-ci.');
       if (opts.dryRun) return res;
       if (opts.confirm && !(await opts.confirm(p))) { res.paused = 'annulé'; return res; }
+      index.lock = { dev: dev.id, label: dev.label, at: now() };
+      await saveIndex(index, source);                      // prend la main et enregistre les éléments repris
 
       let opsSinceSave = 0, lastSave = now(), pause = null;
       const total = p.folderOps.length + p.fileOps.length + p.topDels.length + p.extras.length;
@@ -505,7 +541,7 @@
           const pg = parentG(index, source, it.parent);
           if (!pg) throw new Error('dossier parent introuvable dans le miroir');
           if (op.k === 'mkdir') {
-            const g = await gMkdir(it.name, pg);
+            const g = await gMkdir(it.name, pg, it.id);
             await record(it.id, { g, p: it.parent, n: it.name, f: 1 });
           } else {
             try {
@@ -514,7 +550,7 @@
             } catch (e) {
               if (e.status !== 404) throw e;
               // dossier effacé à la main côté Google : on le recrée et on oublie son contenu (recopié au prochain passage)
-              const g = await gMkdir(it.name, pg);
+              const g = await gMkdir(it.name, pg, it.id);
               forgetDescendants(index, it.id);
               await record(it.id, { g, p: it.parent, n: it.name, f: 1 });
               log('⚠️ Dossier recréé dans Google : ' + it.path + ' — relancez une copie pour compléter son contenu.');
@@ -544,7 +580,7 @@
                 if (e.status !== 404) throw e;
                 const blob = await download(it);
                 const h = await sha1Of(blob);
-                const g = await gUpload(blob, { name: it.name, parents: [pg], appProperties: { od: it.id } });
+                const g = await gUpload(blob, { name: it.name, parents: [pg], appProperties: { od: it.id, t: String(it.tag).slice(0, 100) } });
                 await record(it.id, { g, p: it.parent, n: it.name, f: 0, t: it.tag, s: it.size, h });
               }
             } else {
@@ -558,10 +594,10 @@
                   g = await gUpload(blob, null, op.ex.g);
                 } catch (e) {
                   if (e.status !== 404) throw e;
-                  g = await gUpload(blob, { name: it.name, parents: [pg], appProperties: { od: it.id } });
+                  g = await gUpload(blob, { name: it.name, parents: [pg], appProperties: { od: it.id, t: String(it.tag).slice(0, 100) } });
                 }
               } else {
-                g = await gUpload(blob, { name: it.name, parents: [pg], appProperties: { od: it.id } });
+                g = await gUpload(blob, { name: it.name, parents: [pg], appProperties: { od: it.id, t: String(it.tag).slice(0, 100) } });
               }
               bytesDone += it.size;
               await record(it.id, { g, p: it.parent, n: it.name, f: 0, t: it.tag, s: it.size, h });
@@ -610,6 +646,7 @@
       }
 
       if (stopRequested && !pause) pause = 'stop';
+      if (index.lock) index.lock.done = true;               // la main est rendue
       try { await saveIndex(index, source); }
       catch (e) { if (e instanceof PauseError) pause = pause || e.pause; else log('❌ Enregistrement de l\'index : ' + e.message + ' (le journal local le garde)'); }
       res.paused = pause;
