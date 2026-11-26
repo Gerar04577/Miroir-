@@ -88,8 +88,19 @@ function makeWorld() {
         if (skip + world.pageSize < all.length) body['@odata.nextLink'] = `https://graph.microsoft.com/v1.0/drives/${m[1]}/items/${id}/children?skip=${skip + world.pageSize}`;
         return resp(200, body);
       }
+      m = /\/drives\/([^/]+)\/items\/([^/]+)\/content$/.exec(decodeURIComponent(u.pathname));
+      if (m) {   // comportement réel : /content renvoie le fichier (la redirection est suivie par fetch)
+        if (world.contentBroken) throw new TypeError('Load failed');
+        const it = od.items.get(m[2]); if (!it) return resp(404, 'nope');
+        return resp(200, it.content);
+      }
       m = /\/drives\/([^/]+)\/items\/([^/]+)$/.exec(decodeURIComponent(u.pathname));
-      if (m) { const it = od.items.get(m[2]); if (!it) return resp(404, 'nope'); return resp(200, { id: it.id, '@microsoft.graph.downloadUrl': 'https://dl.files.1drv.com/' + it.id + '?v=' + it.ctag }); }
+      if (m) {   // comportement réel : un $select fait disparaître le lien de téléchargement
+        const it = od.items.get(m[2]); if (!it) return resp(404, 'nope');
+        const body = { id: it.id, name: it.name };
+        if (!u.searchParams.has('$select')) body['@microsoft.graph.downloadUrl'] = 'https://dl.files.1drv.com/' + it.id + '?v=' + it.ctag;
+        return resp(200, body);
+      }
       return resp(400, 'graph route inconnue ' + u.pathname);
     }
     if (u.host === 'dl.files.1drv.com') {
@@ -388,6 +399,15 @@ function buildTree(od) {
   ok(JSON.stringify(W.od.tree('IMMO')) === odBefore, 'OneDrive strictement inchangé');
   r = await W.engine().run(src, {});
   ok(r.plan.counts.reparesGoogle === 0 && r.plan.counts.enTropDansGoogle === 0 && r.plan.fileOps.length === 0, 'passage suivant : plus rien à corriger');
+
+  console.log('\n14) Adresse /content inutilisable → secours par le lien de téléchargement');
+  W.contentBroken = true;
+  W.od.setContent('BAIL', 'bail v4');
+  W.od.add('SEC', 'S1', 'secours.pdf', false, 'sec');
+  r = await W.engine().run(src, {});
+  ok(r.failed.length === 0, 'secours utilisé sans erreur');
+  sameTree(W, src, mirrorRoot(W), 'après téléchargement de secours');
+  W.contentBroken = false;
 
   console.log(`\n✅ ${checks} contrôles réussis`);
 })().catch((e) => { console.error('\n❌ ÉCHEC :', e); process.exit(1); });

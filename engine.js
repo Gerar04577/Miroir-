@@ -1,5 +1,5 @@
 /* Miroir OneDrive -> Google Drive — moteur de synchronisation
- * Fichier : engine.js — VERSION 1.1
+ * Fichier : engine.js — VERSION 1.3
  * Sens unique : OneDrive (LECTURE SEULE, jamais aucune écriture ni suppression) -> Google Drive.
  * À chaque passage, le miroir Google est relu et remis exactement à l'image de OneDrive.
  * Aucune dépendance externe. Testable hors navigateur (fetch / xhrPut injectés).
@@ -7,7 +7,7 @@
 (function (root) {
   'use strict';
 
-  const ENGINE_VERSION = '1.1';
+  const ENGINE_VERSION = '1.3';
   const GRAPH = 'https://graph.microsoft.com/v1.0';
   const GD = 'https://www.googleapis.com/drive/v3';
   const GU = 'https://www.googleapis.com/upload/drive/v3';
@@ -406,20 +406,41 @@
       return p ? p.g : null;
     }
 
+    /* Téléchargement d'un fichier OneDrive.
+     * 1) Méthode principale : GET …/items/{id}/content avec le jeton — même méthode que
+     *    Gestion Loyers et EDL, éprouvée sur ce OneDrive.
+     * 2) Secours : demander l'élément SANS $select (un $select fait disparaître le lien
+     *    @microsoft.graph.downloadUrl), puis télécharger ce lien pré-authentifié. */
     async function download(it) {
-      for (let attempt = 0; ; attempt++) {
+      const base = `/drives/${encodeURIComponent(it.driveId)}/items/${encodeURIComponent(it.realId)}`;
+      let lastErr = null;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        if (attempt) await sleep(1500 * 2 ** (attempt - 1));
+        // 1) /content
         try {
-          const meta = await graph(`/drives/${encodeURIComponent(it.driveId)}/items/${encodeURIComponent(it.realId)}?$select=id,@microsoft.graph.downloadUrl`);
-          const url = meta['@microsoft.graph.downloadUrl'];
-          if (!url) throw new Error('pas d\'adresse de téléchargement');
-          const r = await fetchFn(url);              // adresse pré-authentifiée : pas d'en-tête, pas de pré-requête CORS
-          if (!r.ok) throw new HttpError('Microsoft (téléchargement)', r.status, '');
-          return await r.blob();
+          const tok = await msToken(attempt > 0);
+          const r = await fetchFn(GRAPH + base + '/content', { headers: { Authorization: 'Bearer ' + tok } });
+          if (r.ok) return await r.blob();
+          if (r.status === 404) throw new HttpError('Microsoft (téléchargement)', 404, 'fichier introuvable');
+          lastErr = new HttpError('Microsoft (téléchargement /content)', r.status, await safeText(r));
         } catch (e) {
-          if (e instanceof PauseError || attempt >= 3) throw e;
-          await sleep(1500 * 2 ** attempt);
+          if (e instanceof PauseError || e.status === 404) throw e;
+          lastErr = e;
+        }
+        // 2) lien pré-authentifié, réponse complète
+        try {
+          const meta = await graph(base);
+          const url = meta['@microsoft.graph.downloadUrl'] || meta['@content.downloadUrl'];
+          if (!url) throw new Error('Microsoft n\'a pas fourni de lien de téléchargement');
+          const r = await fetchFn(url);
+          if (r.ok) return await r.blob();
+          lastErr = new HttpError('Microsoft (lien de téléchargement)', r.status, '');
+        } catch (e) {
+          if (e instanceof PauseError) throw e;
+          lastErr = e;
         }
       }
+      throw new Error('Téléchargement impossible : ' + ((lastErr && lastErr.message) || lastErr));
     }
 
     /* ---------- Exécution ---------- */
