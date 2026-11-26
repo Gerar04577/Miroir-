@@ -1,5 +1,5 @@
 /* Miroir OneDrive -> Google Drive — moteur de synchronisation
- * Fichier : engine.js — VERSION 1.3
+ * Fichier : engine.js — VERSION 1.4
  * Sens unique : OneDrive (LECTURE SEULE, jamais aucune écriture ni suppression) -> Google Drive.
  * À chaque passage, le miroir Google est relu et remis exactement à l'image de OneDrive.
  * Aucune dépendance externe. Testable hors navigateur (fetch / xhrPut injectés).
@@ -7,7 +7,7 @@
 (function (root) {
   'use strict';
 
-  const ENGINE_VERSION = '1.3';
+  const ENGINE_VERSION = '1.4';
   const GRAPH = 'https://graph.microsoft.com/v1.0';
   const GD = 'https://www.googleapis.com/drive/v3';
   const GU = 'https://www.googleapis.com/upload/drive/v3';
@@ -18,8 +18,8 @@
   const CHUNK = 8 * 1024 * 1024;          // morceaux de 8 Mo (multiple de 256 Kio exigé par Google)
   const LIST_PARALLEL = 6;
   const TRANSFER_PARALLEL = 3;
-  const SAVE_EVERY_OPS = 25;
-  const SAVE_EVERY_MS = 60000;
+  const SAVE_EVERY_OPS = 300;   // l'index d'« Immobilier » pèse ~3 Mo : le réécrire tous les 25 fichiers enverrait ~2 Go inutiles
+  const SAVE_EVERY_MS = 180000;
 
   class PauseError extends Error {
     constructor(reason) { super('pause:' + reason); this.pause = reason; }
