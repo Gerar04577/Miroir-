@@ -1,5 +1,5 @@
 /* Miroir OneDrive -> Google Drive — moteur de synchronisation
- * Fichier : engine.js — VERSION 3.0
+ * Fichier : engine.js — VERSION 3.1
  * Sens unique : OneDrive (LECTURE SEULE, jamais aucune écriture ni suppression) -> Google Drive.
  * À chaque passage, le miroir Google est relu et remis exactement à l'image de OneDrive.
  * Aucune dépendance externe. Testable hors navigateur (fetch / xhrPut injectés).
@@ -7,7 +7,7 @@
 (function (root) {
   'use strict';
 
-  const ENGINE_VERSION = '3.0';
+  const ENGINE_VERSION = '3.1';
   const GRAPH = 'https://graph.microsoft.com/v1.0';
   const GD = 'https://www.googleapis.com/drive/v3';
   const GU = 'https://www.googleapis.com/upload/drive/v3';
@@ -824,6 +824,101 @@
       return { removed, failed };
     }
 
+    /* ---------- Vérification d'une visite EDL (lecture seule) ----------
+     * EDL calcule sur l'iPhone, AVANT l'envoi, l'empreinte SHA-256 et la taille de chaque photo,
+     * et les inscrit dans visite_<id>.json (déposé dans le dossier du locataire). On télécharge
+     * chaque photo depuis OneDrive et on recalcule : identique au bit près, ou non. */
+    async function contentOf(base, itemId) {
+      let lastErr = null;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        if (attempt) await sleep(1500 * 2 ** (attempt - 1));
+        try {
+          const tok = await msToken(attempt > 0);
+          const r = await fetchFn(GRAPH + base + '/items/' + encodeURIComponent(itemId) + '/content', { headers: { Authorization: 'Bearer ' + tok } });
+          if (r.ok) return await r.blob();
+          if (r.status === 404) { const e = new HttpError('Microsoft', 404, 'absent'); throw e; }
+          lastErr = new HttpError('Microsoft (téléchargement)', r.status, await safeText(r));
+        } catch (e) { if (e.status === 404) throw e; lastErr = e; }
+        try {
+          const meta = await graph(base + '/items/' + encodeURIComponent(itemId));
+          const url = meta['@microsoft.graph.downloadUrl'] || meta['@content.downloadUrl'];
+          if (url) { const r = await fetchFn(url); if (r.ok) return await r.blob(); lastErr = new HttpError('Microsoft (lien)', r.status, ''); }
+        } catch (e) { if (e.status === 404) throw e; lastErr = e; }
+      }
+      throw new Error('Téléchargement impossible : ' + ((lastErr && lastErr.message) || lastErr));
+    }
+    async function sha256Hex(blob) {
+      const d = await crypto.subtle.digest('SHA-256', await blob.arrayBuffer());
+      return Array.from(new Uint8Array(d), (b) => b.toString(16).padStart(2, '0')).join('');
+    }
+    async function verifyEdlVisit(p) {
+      const base = p.driveId ? '/drives/' + encodeURIComponent(p.driveId) : '/me/drive';
+      progress({ phase: 'edl', step: 'fichier' });
+      let url = base + '/items/' + encodeURIComponent(p.folderId) + '/children?$top=200&$select=id,name,size,file';
+      let finalFile = null, draft = null;
+      while (url) {
+        const j = await graph(url);
+        for (const it of j.value || []) {
+          if (it.name === 'visite_' + p.visitId + '.json') finalFile = it;
+          else if (it.name.endsWith('visite_' + p.visitId + '.json')) draft = it;
+        }
+        url = j['@odata.nextLink'] || null;
+      }
+      const vf = finalFile || draft;
+      if (!vf) throw new Error('Le fichier de cette visite n\'est pas encore dans OneDrive. Attendez la fin des envois dans EDL, puis réessayez.');
+      const v = JSON.parse(await (await contentOf(base, vf.id)).text());
+      const photos = v.photos || [];
+      const out = { visitId: p.visitId, unite: (v.bien && (v.bien.unite_source || v.bien.designation)) || '', brouillon: !finalFile,
+        total: photos.length, items: [], ok: 0, bad: 0, pending: 0 };
+      let i = 0, done = 0;
+      const verifyOne = async (ph) => {
+        const r = { nom: ph.nom_fichier || ph.photo_id, kind: 'photo' };
+        if (ph.statut_transfert === 'en_attente' || (!ph.onedrive_item_id && ph.statut_transfert !== 'echec')) { r.state = 'attente'; r.reason = 'encore en attente d\'envoi dans EDL'; return r; }
+        if (ph.statut_transfert === 'echec' || !ph.onedrive_item_id) { r.state = 'bad'; r.reason = 'jamais arrivée dans OneDrive (envoi refusé)'; return r; }
+        let blob;
+        try { blob = await contentOf(base, ph.onedrive_item_id); }
+        catch (e) { r.state = 'bad'; r.reason = e.status === 404 ? 'absente de OneDrive (supprimée ou déplacée ?)' : 'illisible : ' + e.message; return r; }
+        r.size = blob.size;
+        if (ph.empreinte_sha256) {
+          const h = await sha256Hex(blob);
+          if (h === String(ph.empreinte_sha256).toLowerCase()) { r.state = 'ok'; r.reason = 'identique à la photo prise sur place (empreinte SHA-256)'; }
+          else { r.state = 'bad'; r.reason = 'DIFFÉRENTE de la photo prise sur place (' + blob.size + ' octets au lieu de ' + (ph.taille_octets || '?') + ')'; }
+        } else {
+          const chk = await checkBlob(r.nom.endsWith('.jpg') || r.nom.endsWith('.jpeg') ? r.nom : r.nom + '.jpg', blob);
+          const sizeOk = !ph.taille_octets || ph.taille_octets === blob.size;
+          r.state = chk.ok && sizeOk ? 'ok' : 'bad';
+          r.reason = chk.ok && sizeOk ? 'complète (pas d\'empreinte notée par EDL : contrôle de structure et de taille)' : (chk.ok ? 'taille différente de celle notée par EDL' : chk.reason);
+        }
+        return r;
+      };
+      async function worker() {
+        while (i < photos.length && !stopRequested) {
+          const ph = photos[i++];
+          const r = await verifyOne(ph);
+          out.items.push(r);
+          done++; progress({ phase: 'edl', step: 'photos', done, total: photos.length });
+        }
+      }
+      await Promise.all(Array.from({ length: TRANSFER_PARALLEL }, worker));
+      // procès-verbal signé
+      const pv = v.preuve && v.preuve.pv_onedrive_item_id;
+      if (pv) {
+        const r = { nom: 'Procès-verbal (PDF)', kind: 'pv' };
+        try {
+          const b = await contentOf(base, pv);
+          const chk = await checkBlob('pv.pdf', b);
+          r.state = chk.ok ? 'ok' : 'bad'; r.reason = chk.ok ? 'PDF complet' : chk.reason; r.size = b.size;
+        } catch (e) { r.state = 'bad'; r.reason = e.status === 404 ? 'absent de OneDrive' : 'illisible : ' + e.message; }
+        out.items.push(r);
+      }
+      for (const r of out.items) { if (r.state === 'ok') out.ok++; else if (r.state === 'bad') out.bad++; else out.pending++; }
+      const rank = { bad: 0, attente: 1, ok: 2 };
+      out.items.sort((a, b) => (rank[a.state] - rank[b.state]) || String(a.nom).localeCompare(String(b.nom), 'fr'));
+      out.stopped = stopRequested;
+      log(`Visite EDL ${p.visitId} : ${out.ok} ✅, ${out.bad} ❌, ${out.pending} ⏳.`);
+      return out;
+    }
+
     /* ---------- Rapport d'intégrité de OneDrive (lecture seule) ---------- */
     async function integrity(source, opts = {}) {
       stopRequested = false;
@@ -885,7 +980,7 @@
     }
 
     return {
-      run, walk, plan, loadIndex, integrity, removeFromGoogle,
+      run, walk, plan, loadIndex, integrity, removeFromGoogle, verifyEdlVisit,
       stop() { stopRequested = true; },
       _graph: graph
     };

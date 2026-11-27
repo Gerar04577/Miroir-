@@ -1,9 +1,9 @@
 /* Miroir OneDrive -> Google Drive — interface et connexions
- * Fichier : app.js — VERSION 3.0
+ * Fichier : app.js — VERSION 3.1
  */
 (function () {
   'use strict';
-  const APP_VERSION = '3.0';
+  const APP_VERSION = '3.1';
   const DEFAULT_MS_CLIENT = '94a21be5-6e9c-42ea-b338-0c29fe0e5019'; // inscription Entra DÉDIÉE « Miroir », seule permission Files.Read : Microsoft refuse toute écriture dans OneDrive
   const DEFAULT_G_CLIENT = '433250610871-8j2bps6kdmvrr5049hekhepjg7eh6dbt.apps.googleusercontent.com'; // projet Google « Miroir » (seul jemagerard@gmail.com est autorisé)
   const MS_AUTH = 'https://login.microsoftonline.com/consumers/oauth2/v2.0';
@@ -240,6 +240,10 @@
     if (p.phase === 'walk') {
       $('pText').textContent = `Lecture de OneDrive : ${p.folders} dossiers lus, ${p.items} éléments trouvés…`;
       $('pBar').style.width = '5%';
+    } else if (p.phase === 'edl') {
+      $('edlBar').style.width = p.step === 'photos' && p.total ? Math.max(5, Math.round(100 * p.done / p.total)) + '%' : '5%';
+      $('edlText').textContent = p.step === 'photos' ? `Vérification des photos : ${p.done} / ${p.total}… (${elapsed()})` : 'Lecture du fichier de la visite…';
+      return;
     } else if (p.phase === 'remove') {
       const pct = p.total ? Math.max(3, Math.round(100 * p.done / p.total)) : 3;
       const txt = p.done ? `Retrait de Google : ${p.done} / ${p.total}… (${elapsed()})` : 'Préparation du retrait… (' + elapsed() + ')';
@@ -392,6 +396,40 @@
     } catch (e) { $('iText').textContent = '❌ ' + e.message; log('❌ ' + e.message); }
     running = false; intMode = false; await keepAwake(false); render();
   }
+  /* ---------------- Vérification d'une visite EDL (appelée par le bouton d'EDL) ---------------- */
+  let lastEdl = [];
+  async function verifyEdl() {
+    const p = get('miroir.edl', null);
+    if (!p || running) return;
+    $('edlCard').hidden = false;
+    $('edlTitle').textContent = 'Vérification de la visite EDL' + (p.unite ? ' — ' + p.unite : '');
+    try { await msToken(); }
+    catch (e) { $('edlText').textContent = 'Touchez « Connecter » (Microsoft) : la vérification démarrera ensuite.'; return; }
+    running = true; intMode = true; intT0 = Date.now(); render(); await keepAwake(true);
+    $('edlList').innerHTML = ''; $('edlSummary').textContent = ''; $('edlCopy').hidden = true;
+    try { $('edlCard').scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (e) { /* facultatif */ }
+    engine = MiroirEngine.createEngine({ fetch: (u, o) => fetch(u, o), xhrPut, msToken, gToken: async () => { throw new MiroirEngine.PauseError('google'); }, gTokenQuiet: () => null, log, progress, journal, device: DEVICE });
+    try {
+      const r = await engine.verifyEdlVisit(p);
+      lastEdl = r.items;
+      $('edlBar').style.width = '100%';
+      $('edlText').textContent = `${r.total} photo(s)${r.items.some((x) => x.kind === 'pv') ? ' + procès-verbal' : ''} — ✅ ${r.ok} identique(s), ❌ ${r.bad} à reprendre, ⏳ ${r.pending} en attente d'envoi. (${elapsed()})`;
+      $('edlSummary').textContent = r.bad ? '❌ À REPRENDRE : ces photos ne sont pas arrivées identiques dans OneDrive.' : r.pending ? '⏳ Des photos attendent encore d\'être envoyées par EDL : relancez la vérification plus tard.' : '✅ Toutes les photos sont dans OneDrive, identiques au bit près à celles prises sur place.';
+      $('edlSummary').style.color = r.bad ? '#c62828' : '';
+      const box = $('edlList');
+      for (const x of r.items) {
+        const d = document.createElement('div');
+        d.className = 'susp';
+        d.textContent = (x.state === 'ok' ? '✅ ' : x.state === 'bad' ? '❌ ' : '⏳ ') + x.nom + '\n   ' + x.reason;
+        if (x.state === 'bad') d.style.color = '#c62828';
+        box.appendChild(d);
+      }
+      $('edlCopy').hidden = !r.bad && !r.pending;
+      if (!r.bad && !r.pending) del('miroir.edl');
+    } catch (e) { $('edlText').textContent = '❌ ' + e.message; log('❌ ' + e.message); }
+    running = false; intMode = false; await keepAwake(false); render();
+  }
+
   async function checkFiles() {
     if (running) return;
     if (!cfg.source) { alert('Choisissez d\'abord le dossier OneDrive (« Immobilier 2025-2026 »).'); return; }
@@ -464,6 +502,7 @@
     $('btnRun').disabled = running || J; $('btnDry').disabled = running || J;
     $('iQuick').disabled = running || J; $('iDeep').disabled = running || J; $('iRemove').disabled = running || J;
     $('iCheck').disabled = running;
+    $('edlGo').disabled = running;
     $('btnPick').disabled = running;
     $('btnG').disabled = J; $('gNeedBtn').disabled = J;
     document.querySelectorAll('.jm-only').forEach((el) => el.classList.toggle('grise', J));
@@ -492,6 +531,12 @@
     $('iDeep').onclick = () => runIntegrity(true);
     $('iRemove').onclick = removeCorrupt;
     $('iCheck').onclick = checkFiles;
+    $('edlGo').onclick = verifyEdl;
+    $('edlCopy').onclick = async () => {
+      const txt = lastEdl.filter((x) => x.state !== 'ok').map((x) => (x.state === 'bad' ? '❌ ' : '⏳ ') + x.nom + ' — ' + x.reason).join('\n');
+      try { await navigator.clipboard.writeText(txt); $('edlCopy').textContent = 'Liste copiée ✓'; setTimeout(() => { $('edlCopy').textContent = 'Copier la liste'; }, 2000); }
+      catch (e) { prompt('Liste à copier :', txt); }
+    };
     $('iCopy').onclick = async () => {
       const txt = lastSuspects.map((x) => `${x.path} — ${x.reason} — ${fmtBytes(x.size || 0)}${x.mod ? ' — ' + fmtDate(x.mod) : ''}${x.inGoogle ? ' — copie dans Google' : ''}`).join('\n');
       try { await navigator.clipboard.writeText(txt); $('iCopy').textContent = 'Liste copiée ✓'; setTimeout(() => { $('iCopy').textContent = 'Copier la liste'; }, 2000); }
@@ -521,12 +566,22 @@
     });
   }
 
+  // Appel depuis EDL : ?edl=<visite>&d=<drive>&f=<dossier>&u=<unité> — gardé jusqu'à la vérification
+  (function captureEdl() {
+    const q = new URLSearchParams(location.search);
+    if (q.get('edl') && q.get('f')) {
+      set('miroir.edl', { visitId: q.get('edl'), driveId: q.get('d') || '', folderId: q.get('f'), unite: q.get('u') || '', at: Date.now() });
+      history.replaceState(null, '', REDIRECT);
+    }
+  })();
+
   window.addEventListener('DOMContentLoaded', async () => {
     if (!USER) await askUser();
     $('ver').textContent = 'v' + APP_VERSION + ' · moteur v' + MiroirEngine.ENGINE_VERSION;
     bind();
     await handleRedirect();
     render();
+    if (get('miroir.edl', null)) { $('edlCard').hidden = false; verifyEdl(); }
     const resume = localStorage.getItem(LS.resume);
     if (resume && !isJulien() && gTokenQuiet() && get(LS.ms, null)) {
       del(LS.resume);

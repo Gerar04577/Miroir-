@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- Miroir OneDrive -> Google Drive — index.html — VERSION 3.0 -->
+<!-- Miroir OneDrive -> Google Drive — index.html — VERSION 3.1 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -62,6 +62,17 @@
 <div class="muted" id="who" style="margin:-6px 2px 10px"></div>
 
 <div class="card note">OneDrive est seulement <b>lu</b>, jamais modifié. La copie dans Google est tenue à l'image de OneDrive, <b>sauf les fichiers corrompus, qui ne sont jamais copiés</b> : ils sont signalés.</div>
+
+<div class="card" id="edlCard" hidden style="border:2px solid #1f6feb">
+  <h2 id="edlTitle">Vérification de la visite EDL</h2>
+  <div class="muted">Chaque photo est téléchargée depuis OneDrive et comparée à l'empreinte calculée par EDL au moment de la prise. Lecture seule.</div>
+  <button class="big main" id="edlGo">Vérifier la visite</button>
+  <div class="bar"><div id="edlBar" style="height:100%;width:0;background:#1f6feb;transition:width .3s"></div></div>
+  <div id="edlText"></div>
+  <div id="edlSummary" style="margin-top:8px;font-weight:600"></div>
+  <div id="edlList"></div>
+  <button id="edlCopy" hidden style="margin-top:8px">Copier la liste</button>
+</div>
 
 <div class="card">
   <h2>Connexions</h2>
@@ -172,7 +183,7 @@
   </div>
 </div>
 
-<script src="engine.js?v=3.0"></script>
-<script src="app.js?v=3.0"></script>
+<script src="engine.js?v=3.1"></script>
+<script src="app.js?v=3.1"></script>
 </body>
 </html>

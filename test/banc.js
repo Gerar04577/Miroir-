@@ -561,5 +561,33 @@ function buildTree(od) {
   ok(cf.suspects.length === 2 && cf.recent[0].ok === false, 'IMG_9002 et IMG_9003 : ❌ corrompues, listées en premier');
   ok(W.gd.files.size === nG, 'rien n\'est écrit dans Google');
 
+  console.log('\n24) Vérification d\'une visite EDL (empreintes SHA-256 notées par EDL avant l\'envoi)');
+  W = makeWorld(); buildTree(W.od);
+  const sha256 = (t) => crypto.createHash('sha256').update(Buffer.from(t, 'latin1')).digest('hex');
+  const ph = (id, nom, content) => { W.od.add(id, 'S2', nom, false, content); return { photo_id: id, nom_fichier: nom, onedrive_item_id: id, statut_transfert: 'confirme',
+    empreinte_sha256: sha256(W.od.items.get(id).content), taille_octets: W.od.items.get(id).content.length }; };
+  const p1 = ph('E1', 'EDLE_CH1-A_001.jpg', 'mur A'), p2 = ph('E2', 'EDLE_CH1-B_002.jpg', 'mur B'), p3 = ph('E3', 'EDLE_CH1-C_003.jpg', 'mur C');
+  W.od.items.get('E2').content = W.od.items.get('E2').content.slice(0, 15000);      // arrivée coupée dans OneDrive
+  W.od.remove('E3');                                                                 // disparue de OneDrive
+  const p4 = { photo_id: 'E4', nom_fichier: 'EDLE_SDB-A_001.jpg', statut_transfert: 'en_attente', empreinte_sha256: 'x' };
+  const p5 = { photo_id: 'E5', nom_fichier: 'EDLE_SDB-B_002.jpg', statut_transfert: 'echec', empreinte_sha256: 'y' };
+  W.od.add('PV', 'S2', 'PV-EDLE.pdf', false, 'proces-verbal signe');
+  const visite = { visit_id: 'v123', bien: { unite_source: 'Studio 2' }, photos: [p1, p2, p3, p4, p5], preuve: { pv_onedrive_item_id: 'PV' } };
+  W.od.add('VJ', 'S2', 'visite_v123.json', false, Buffer.from(JSON.stringify(visite), 'utf8').toString('latin1'), true);
+  const nG24 = W.gd.files.size;
+  const rv = await W.engine().verifyEdlVisit({ visitId: 'v123', driveId: 'DRV1', folderId: 'S2' });
+  const st24 = (n) => (rv.items.find((x) => x.nom === n) || {}).state;
+  ok(st24('EDLE_CH1-A_001.jpg') === 'ok', 'photo intacte : ✅ identique au bit près');
+  ok(st24('EDLE_CH1-B_002.jpg') === 'bad' && /DIFFÉRENTE/.test(rv.items.find((x) => x.nom === 'EDLE_CH1-B_002.jpg').reason), 'photo coupée : ❌ ' + rv.items.find((x) => x.nom === 'EDLE_CH1-B_002.jpg').reason);
+  ok(st24('EDLE_CH1-C_003.jpg') === 'bad' && /absente/.test(rv.items.find((x) => x.nom === 'EDLE_CH1-C_003.jpg').reason), 'photo disparue : ❌ absente de OneDrive');
+  ok(st24('EDLE_SDB-A_001.jpg') === 'attente', 'photo pas encore envoyée : ⏳');
+  ok(st24('EDLE_SDB-B_002.jpg') === 'bad', 'photo refusée à l\'envoi : ❌');
+  ok(st24('Procès-verbal (PDF)') === 'ok', 'procès-verbal : ✅ PDF complet');
+  ok(rv.ok === 2 && rv.bad === 3 && rv.pending === 1 && rv.items[0].state === 'bad', 'bilan 2 ✅ / 3 ❌ / 1 ⏳, les ❌ en premier');
+  ok(W.gd.files.size === nG24, 'rien écrit dans Google');
+  let err24 = null;
+  try { await W.engine().verifyEdlVisit({ visitId: 'inconnue', driveId: 'DRV1', folderId: 'S2' }); } catch (e) { err24 = e.message; }
+  ok(/pas encore dans OneDrive/.test(err24 || ''), 'visite introuvable : message clair');
+
   console.log(`\n✅ ${checks} contrôles réussis`);
 })().catch((e) => { console.error('\n❌ ÉCHEC :', e); process.exit(1); });
