@@ -1,9 +1,9 @@
 /* Miroir OneDrive -> Google Drive — interface et connexions
- * Fichier : app.js — VERSION 2.0
+ * Fichier : app.js — VERSION 2.1
  */
 (function () {
   'use strict';
-  const APP_VERSION = '2.0';
+  const APP_VERSION = '2.1';
   const DEFAULT_MS_CLIENT = ''; // inscription Entra DÉDIÉE « Miroir », avec la seule permission Files.Read : Microsoft refuse alors toute écriture dans OneDrive
   const MS_AUTH = 'https://login.microsoftonline.com/consumers/oauth2/v2.0';
   const MS_SCOPE = 'Files.Read offline_access';
@@ -223,6 +223,10 @@
     if (p.phase === 'walk') {
       $('pText').textContent = `Lecture de OneDrive : ${p.folders} dossiers lus, ${p.items} éléments trouvés…`;
       $('pBar').style.width = '5%';
+    } else if (p.phase === 'remove') {
+      $('iProgress').hidden = false;
+      $('iBar').style.width = (p.total ? Math.max(3, Math.round(100 * p.done / p.total)) : 3) + '%';
+      $('iText').textContent = p.done ? `Retrait de Google : ${p.done} / ${p.total}…` : 'Lecture de la liste Google…';
     } else if (p.phase === 'integrity') {
       const pct = p.total ? Math.round(100 * p.done / p.total) : 100;
       $('iBar').style.width = Math.max(3, pct) + '%';
@@ -241,6 +245,7 @@
     const c = p.counts;
     return `Nouveaux dossiers : ${c.nouveauxDossiers}\nNouveaux fichiers : ${c.nouveauxFichiers}\nFichiers modifiés : ${c.modifies}\nRenommés / déplacés : ${c.deplaces}\nDisparus de OneDrive (à retirer de la copie) : ${c.supprimes}` +
       `\nDéjà à jour : ${c.dejaAJour}` +
+      (c.corrompus ? `\n❌ Corrompus dans OneDrive, ne seront PAS copiés : ${c.corrompus}` : '') +
       `\nCopie Google à corriger (manquant, altéré, déplacé à la main) : ${c.reparesGoogle || 0}` +
       `\nEn trop dans Google (absent de OneDrive) : ${c.enTropDansGoogle || 0}` +
       ((c.supprimes || c.enTropDansGoogle) ? (cfg.delMode === 'trash' ? ' → corbeille Google' : ' → _Supprimés') : '') +
@@ -375,11 +380,16 @@
     running = true; render();
     engine = MiroirEngine.createEngine({ fetch: (u, o) => fetch(u, o), xhrPut, msToken, gToken, gTokenQuiet, log, progress, journal, device: DEVICE });
     try {
-      const n = await engine.removeFromGoogle(cfg.source, inG.map((x) => x.id));
-      for (const x of inG) x.inGoogle = false;
+      const r = await engine.removeFromGoogle(cfg.source, inG.map((x) => x.id));
+      const failedIds = new Set(r.failed.map((f) => f.id));
+      for (const x of inG) if (!failedIds.has(x.id)) x.inGoogle = false;
       showSuspects(lastSuspects, $('iSummary').textContent);
-      $('iText').textContent = `🗑️ ${n} copie(s) corrompue(s) retirée(s) de Google (corbeille).`;
-    } catch (e) { $('iText').textContent = '❌ ' + e.message; log('❌ ' + e.message); }
+      $('iBar').style.width = '100%';
+      $('iText').textContent = `🗑️ ${r.removed} copie(s) corrompue(s) retirée(s) de Google (corbeille).` + (r.failed.length ? ` ❌ ${r.failed.length} échec(s) : voir le Journal, puis réessayez.` : '');
+    } catch (e) {
+      $('iText').textContent = e instanceof MiroirEngine.PauseError ? '⏸ Connexion Google expirée : touchez « Connecter » (Google), puis recommencez. Ce qui est fait reste fait.' : '❌ ' + e.message;
+      log('❌ ' + e.message);
+    }
     running = false; render();
   }
 

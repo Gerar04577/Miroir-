@@ -258,6 +258,7 @@ function mirrorRoot(world) {
   const top = [...world.gd.files.values()].find((f) => f.name === 'Miroir OneDrive' && !f.trashed);
   return [...world.gd.files.values()].find((f) => f.parents.includes(top.id) && f.folder && f.name === 'Immobilier' && !f.trashed).id;
 }
+const allSusp = (r) => (r.suspects || []).concat(r.sizeSuspects || []);
 const big = (ch, mb) => ch.repeat(Math.floor(mb * 1024 * 1024));
 
 function buildTree(od) {
@@ -477,9 +478,9 @@ function buildTree(od) {
   r = await W.engine().run(src, {});
   const gHas = (name) => [...W.gd.files.values()].some((f) => f.name === name && !f.trashed);
   ok(!gHas('IMG_3376.jpeg'), 'la photo corrompue n\'a PAS été copiée dans Google');
-  ok(r.suspects.length === 1 && /taille impossible|n'est pas/.test(r.suspects[0].reason), 'elle est signalée : ' + r.suspects[0].reason);
+  ok(allSusp(r).length === 1 && /taille impossible|n'est pas/.test(allSusp(r)[0].reason) && r.plan.counts.corrompus === 1 && !r.plan.fileOps.some((o) => o.it.id === 'CORR'), 'signalée, comptée « corrompue » et non « nouvelle » : ' + allSusp(r)[0].reason);
   r = await W.engine().run(src, {});
-  ok(!gHas('IMG_3376.jpeg') && r.suspects.length === 1, 'au passage suivant : toujours pas copiée, toujours signalée');
+  ok(!gHas('IMG_3376.jpeg') && allSusp(r).length === 1, 'au passage suivant : toujours pas copiée, toujours signalée');
 
   console.log('\n18) Variantes de corruption : vide, coupée, remplie de zéros, remplacée par du texte');
   const mk = (id, name, raw) => W.od.add(id, 'B1', name, false, raw, true);
@@ -490,7 +491,7 @@ function buildTree(od) {
   mk('C4', 'texte.jpg', '<html>Erreur 503 : service indisponible</html>' + ' '.repeat(30000));
   mk('C5', 'coupe.pdf', '%PDF-1.4\n' + ' '.repeat(5000));
   r = await W.engine().run(src, {});
-  for (const n of ['vide.jpg', 'coupee.jpg', 'zeros.jpg', 'texte.jpg', 'coupe.pdf']) ok(!gHas(n), n + ' non copié — ' + (r.suspects.find((x) => x.path.endsWith(n)) || {}).reason);
+  for (const n of ['vide.jpg', 'coupee.jpg', 'zeros.jpg', 'texte.jpg', 'coupe.pdf']) ok(!gHas(n), n + ' non copié — ' + (allSusp(r).find((x) => x.path.endsWith(n)) || {}).reason);
   ok(/texte/.test(r.suspects.find((x) => x.path.endsWith('texte.jpg')).preview), 'le contenu réel est décrit : ' + r.suspects.find((x) => x.path.endsWith('texte.jpg')).preview);
 
   console.log('\n19) Une bonne photo déjà copiée se corrompt dans OneDrive : la copie Google reste intacte');
@@ -499,7 +500,7 @@ function buildTree(od) {
   r = await W.engine().run(src, {});
   const g7 = [...W.gd.files.values()].find((f) => f.name === 'photo 7.jpg');
   ok(g7.content === before7, 'copie Google de photo 7 inchangée (bonne version conservée)');
-  ok(r.protectedCount === 1 && r.suspects.some((x) => x.path.endsWith('photo 7.jpg') && x.inGoogle), 'signalée comme corrompue dans OneDrive, copie Google protégée');
+  ok(allSusp(r).some((x) => x.path.endsWith('photo 7.jpg') && x.inGoogle), 'signalée comme corrompue dans OneDrive, copie Google protégée');
 
   console.log('\n20) Vraie modification : l\'ancienne version Google est conservée pour toujours');
   const gBail2 = [...W.gd.files.values()].find((f) => f.name === "Bail d'Aurélie.pdf");
@@ -524,10 +525,27 @@ function buildTree(od) {
   ok(['coupee.jpg', 'zeros.jpg', 'texte.jpg', 'coupe.pdf'].every((n) => names2.includes(n)), 'contrôle complet : trouve aussi les fichiers coupés ou remplacés (' + names2.length + ' au total)');
   ok(!names2.includes("Bail d'Aurélie.pdf") && !names2.includes('photo 1 renommée.jpg') && !names2.includes('photo 6.jpg'), 'aucun faux positif sur les bons fichiers');
   const gP5 = [...W.gd.files.values()].find((f) => f.name === 'photo 5.jpg' && !f.trashed);
-  const n = await e21.removeFromGoogle(src, [rep1.suspects.find((x) => x.path.endsWith('photo 5.jpg')).id]);
-  ok(n === 1 && gP5.trashed, 'retrait sur demande : photo 5 mise à la corbeille Google');
+  const rr = await e21.removeFromGoogle(src, [rep1.suspects.find((x) => x.path.endsWith('photo 5.jpg')).id]);
+  ok(rr.removed === 1 && rr.failed.length === 0 && gP5.trashed, 'retrait sur demande : photo 5 mise à la corbeille Google');
   r = await W.engine().run(src, {});
-  ok(!gHas('photo 5.jpg') && r.suspects.some((x) => x.path.endsWith('photo 5.jpg')), 'ensuite : photo 5 ni recopiée ni oubliée — toujours signalée');
+  ok(!gHas('photo 5.jpg') && allSusp(r).some((x) => x.path.endsWith('photo 5.jpg')), 'ensuite : photo 5 ni recopiée ni oubliée — toujours signalée');
+
+  console.log('\n22) Retrait en nombre (220 copies corrompues comme chez vous)');
+  W = makeWorld(); buildTree(W.od);
+  for (let i = 0; i < 220; i++) W.od.add('Q' + i, 'B1', 'IMG_' + (3300 + i) + '.jpeg', false, 'ok' + i);
+  await W.engine().run(src, {});                                    // copiées alors qu'elles étaient bonnes…
+  for (let i = 0; i < 220; i++) W.od.items.get('Q' + i).content = 'bplist00' + 'x'.repeat(127);   // …puis corrompues (même version)
+  const e22 = W.engine();
+  const rep22 = await e22.integrity(src, {});
+  ok(rep22.suspects.length === 220 && rep22.suspects.every((x) => x.inGoogle), '220 copies corrompues repérées dans Google');
+  let lastProg = null;
+  const e22b = W.engine({ progress: (pp) => { if (pp.phase === 'remove') lastProg = pp; } });
+  const rr22 = await e22b.removeFromGoogle(src, rep22.suspects.map((x) => x.id));
+  ok(rr22.removed === 220 && rr22.failed.length === 0, '220 retirées, aucun échec');
+  ok(lastProg && lastProg.done === 220 && lastProg.total === 220, 'avancement affiché jusqu\'à 220 / 220');
+  r = await W.engine().run(src, {});
+  ok(r.plan.counts.corrompus === 220 && r.plan.counts.nouveauxFichiers === 0 && r.plan.fileOps.length === 0, 'passage suivant : 220 « corrompus, non copiés », 0 nouveau, rien téléchargé');
+  ok(r.plan.counts.enTropDansGoogle === 0, 'rien de « en trop »');
 
   console.log(`\n✅ ${checks} contrôles réussis`);
 })().catch((e) => { console.error('\n❌ ÉCHEC :', e); process.exit(1); });

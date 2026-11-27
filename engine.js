@@ -1,5 +1,5 @@
 /* Miroir OneDrive -> Google Drive — moteur de synchronisation
- * Fichier : engine.js — VERSION 2.0
+ * Fichier : engine.js — VERSION 2.1
  * Sens unique : OneDrive (LECTURE SEULE, jamais aucune écriture ni suppression) -> Google Drive.
  * À chaque passage, le miroir Google est relu et remis exactement à l'image de OneDrive.
  * Aucune dépendance externe. Testable hors navigateur (fetch / xhrPut injectés).
@@ -7,7 +7,7 @@
 (function (root) {
   'use strict';
 
-  const ENGINE_VERSION = '2.0';
+  const ENGINE_VERSION = '2.1';
   const GRAPH = 'https://graph.microsoft.com/v1.0';
   const GD = 'https://www.googleapis.com/drive/v3';
   const GU = 'https://www.googleapis.com/upload/drive/v3';
@@ -491,7 +491,8 @@
     }
 
     /* ---------- Plan : ce qu'il faut faire ---------- */
-    function plan(walkRes, index) {
+    function plan(walkRes, index, corrupt) {
+      corrupt = corrupt || new Set();
       const seen = new Set();
       const folderOps = [], fileOps = [];
       let bytes = 0;
@@ -502,6 +503,8 @@
         if (it.folder) {
           if (!ex) folderOps.push({ k: 'mkdir', it });
           else if (moved) folderOps.push({ k: 'move', it, ex });
+        } else if (corrupt.has(it.id)) {
+          if (ex && moved) fileOps.push({ k: 'move', it, ex });   // corrompu : jamais copié ; seul un déplacement est suivi
         } else if (!ex) { fileOps.push({ k: 'new', it }); bytes += it.size; }
         else if (ex.t !== it.tag || ex.s !== it.size) { fileOps.push({ k: 'update', it, ex, moved }); bytes += it.size; }
         else if (moved) fileOps.push({ k: 'move', it, ex });
@@ -598,11 +601,11 @@
         res.verifyComplete = gt.complete;
       } catch (e) { if (e instanceof PauseError) { res.paused = e.pause; return res; } throw e; }
       if (stopRequested) { res.paused = 'stop'; return res; }
-      const p = plan(w, index);
-      // fichiers corrompus repérés à la taille, y compris ceux déjà copiés autrefois (avant la v2.0)
-      const planned = new Set(p.fileOps.map((o) => o.it.id));
-      res.sizeSuspects = w.items.filter((i) => !i.folder && !planned.has(i.id) && suspectBySize(i.name, i.size))
-        .map((i) => ({ id: i.id, path: i.path, size: i.size, mod: i.mod, reason: suspectBySize(i.name, i.size), inGoogle: !!index.items[i.id] }));
+      // fichiers corrompus repérés à la taille (vide, taille impossible) : jamais copiés, jamais téléchargés
+      const corruptFiles = w.items.filter((i) => !i.folder && suspectBySize(i.name, i.size));
+      const p = plan(w, index, new Set(corruptFiles.map((i) => i.id)));
+      res.sizeSuspects = corruptFiles.map((i) => ({ id: i.id, path: i.path, size: i.size, mod: i.mod, reason: suspectBySize(i.name, i.size), inGoogle: !!index.items[i.id] }));
+      p.counts.corrompus = corruptFiles.length;
       p.verif = ver.fix;
       p.extras = (w.complete && res.verifyComplete) ? ver.extras : [];
       p.counts.enTropDansGoogle = p.extras.length ? ver.extrasCount : 0;
@@ -790,22 +793,35 @@
 
     /* Retire de Google des fichiers corrompus copiés autrefois — UNIQUEMENT sur demande explicite (corbeille Google) */
     async function removeFromGoogle(source, odIds) {
+      progress({ phase: 'remove', done: 0, total: odIds.length });
       const index = await loadIndex(source);
-      let removed = 0;
-      for (const id of odIds) {
-        const ex = index.items[id];
-        if (!ex || ex.f) continue;
-        try {
-          await drive(GD + '/files/' + encodeURIComponent(ex.g) + '?fields=id', {
-            method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ trashed: true })
-          });
-        } catch (e) { if (e.status !== 404) throw e; }
-        delete index.items[id]; journal.add(source.id, { id, del: true });
-        removed++;
-        log('🗑️ Retiré de Google (corbeille) : ' + id);
+      const todo = odIds.filter((id) => index.items[id] && !index.items[id].f);
+      let removed = 0, done = 0, i = 0, pauseErr = null;
+      const failed = [];
+      async function worker() {
+        while (i < todo.length && !pauseErr) {
+          const id = todo[i++];
+          const ex = index.items[id];
+          try {
+            try {
+              await drive(GD + '/files/' + encodeURIComponent(ex.g) + '?fields=id', {
+                method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ trashed: true })
+              });
+            } catch (e) { if (e.status !== 404) throw e; }
+            delete index.items[id]; journal.add(source.id, { id, del: true });
+            removed++;
+          } catch (e) {
+            if (e instanceof PauseError) { pauseErr = e; break; }
+            failed.push({ id, err: e.message }); log('❌ Retrait impossible (' + id + ') : ' + e.message);
+          }
+          done++; progress({ phase: 'remove', done, total: todo.length });
+        }
       }
+      await Promise.all(Array.from({ length: 4 }, worker));
       await saveIndex(index, source);
-      return removed;
+      log('🗑️ ' + removed + ' copie(s) corrompue(s) retirée(s) de Google (corbeille).');
+      if (pauseErr) throw pauseErr;
+      return { removed, failed };
     }
 
     /* ---------- Rapport d'intégrité de OneDrive (lecture seule) ---------- */
