@@ -3,7 +3,19 @@
 const assert = require('assert');
 const path = require('path');
 const crypto = require('crypto');
-const sha1 = (t) => crypto.createHash('sha1').update(Buffer.from(t, 'utf8')).digest('hex');
+const sha1 = (t) => crypto.createHash('sha1').update(Buffer.from(t, 'latin1')).digest('hex');
+const L1 = (t) => new Blob([Uint8Array.from(t, (c) => c.charCodeAt(0) & 255)]);
+// contenu réaliste selon le type de fichier (sinon le contrôle d'intégrité le refuserait, à raison)
+function wrap(name, c) {
+  if (c == null) return c;
+  const ext = (name.split('.').pop() || '').toLowerCase();
+  const pad = (n) => (c.length < n ? ' '.repeat(n - c.length) : '');   // une vraie photo n'est jamais minuscule
+  if (ext === 'jpg' || ext === 'jpeg') return '\xFF\xD8\xFF\xE0' + c + pad(21000) + '\xFF\xD9';
+  if (ext === 'pdf') return '%PDF-1.4\n' + c + pad(1200) + '\n%%EOF\n';
+  if (ext === 'docx') return 'PK\x03\x04' + c + pad(2200) + 'PK\x05\x06' + '\0'.repeat(18);
+  if (ext === 'mp4' || ext === 'mov' || ext === 'heic') return '\0\0\0\x18ftypisom' + c + pad(21000);
+  return c;
+}
 const { createEngine, PauseError } = require(path.join(__dirname, '..', 'engine.js'));
 
 let checks = 0;
@@ -12,11 +24,11 @@ function ok(cond, msg) { assert.ok(cond, msg); checks++; console.log('  ✔ ' + 
 /* ---------------- Faux OneDrive ---------------- */
 class FakeOneDrive {
   constructor() { this.items = new Map(); this.n = 0; this.driveId = 'DRV1'; this.failList = new Set(); this.calls = 0; this.add('ROOT', null, 'root', true); }
-  add(id, parent, name, folder, content) {
-    const it = { id, parent, name, folder, content: content || null, ctag: 'c' + (++this.n) };
+  add(id, parent, name, folder, content, raw) {
+    const it = { id, parent, name, folder, content: content == null ? null : (raw ? content : wrap(name, content)), ctag: 'c' + (++this.n) };
     this.items.set(id, it); return it;
   }
-  setContent(id, c) { const it = this.items.get(id); it.content = c; it.ctag = 'c' + (++this.n); }
+  setContent(id, c, raw) { const it = this.items.get(id); it.content = raw ? c : wrap(it.name, c); it.ctag = 'c' + (++this.n); }
   rename(id, name) { this.items.get(id).name = name; }
   move(id, parent) { this.items.get(id).parent = parent; }
   remove(id) { for (const k of this.kids(id)) this.remove(k.id); this.items.delete(id); }
@@ -48,16 +60,18 @@ class FakeDrive {
   }
 }
 
-function resp(status, body, headers = {}) {
+function resp(status, body, headers = {}, bytes = false) {
   const h = new Map(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v]));
   const text = body === undefined || body === null ? '' : (typeof body === 'string' ? body : JSON.stringify(body));
   return {
     status, ok: status >= 200 && status < 300,
     headers: { get: (k) => h.get(k.toLowerCase()) || null },
-    text: async () => text, json: async () => JSON.parse(text), blob: async () => new Blob([text])
+    text: async () => bytes ? Buffer.from(text, 'latin1').toString('utf8') : text,
+    json: async () => JSON.parse(text),
+    blob: async () => bytes ? L1(text) : new Blob([text])
   };
 }
-async function bodyText(b) { if (b == null) return ''; if (typeof b === 'string') return b; return await b.text(); }
+async function bodyText(b) { if (b == null) return ''; if (typeof b === 'string') return b; return Buffer.from(await b.arrayBuffer()).toString('latin1'); }
 
 function makeWorld() {
   const od = new FakeOneDrive();
@@ -92,7 +106,7 @@ function makeWorld() {
       if (m) {   // comportement réel : /content renvoie le fichier (la redirection est suivie par fetch)
         if (world.contentBroken) throw new TypeError('Load failed');
         const it = od.items.get(m[2]); if (!it) return resp(404, 'nope');
-        return resp(200, it.content);
+        return resp(200, it.content, {}, true);
       }
       m = /\/drives\/([^/]+)\/items\/([^/]+)$/.exec(decodeURIComponent(u.pathname));
       if (m) {   // comportement réel : un $select fait disparaître le lien de téléchargement
@@ -106,7 +120,7 @@ function makeWorld() {
     if (u.host === 'dl.files.1drv.com') {
       assert.ok(!auth, 'téléchargement sans en-tête Authorization');
       const it = od.items.get(u.pathname.slice(1));
-      return resp(200, it.content);
+      return resp(200, it.content, {}, true);
     }
     /* --- Google --- */
     if (u.host === 'www.googleapis.com') {
@@ -135,8 +149,8 @@ function makeWorld() {
         const f = gd.files.get(decodeURIComponent(m[1]));
         if (!f) return resp(404, 'not found');
         if (method === 'GET') {
-          if (u.searchParams.get('alt') === 'media') return resp(200, f.content);
-          return resp(200, { id: f.id, trashed: f.trashed, parents: f.parents });
+          if (u.searchParams.get('alt') === 'media') return resp(200, f.content, {}, true);
+          return resp(200, { id: f.id, trashed: f.trashed, parents: f.parents, headRevisionId: 'rev-' + f.id + '-' + (f.rev || 0) });
         }
         if (method === 'PATCH') {
           const body = opt.body ? JSON.parse(opt.body) : {};
@@ -148,13 +162,20 @@ function makeWorld() {
           return resp(200, { id: f.id });
         }
       }
+      m = /^\/drive\/v3\/files\/([^/]+)\/revisions\/([^/]+)$/.exec(p);
+      if (m && method === 'PATCH') {
+        const f = gd.files.get(decodeURIComponent(m[1])); if (!f) return resp(404, 'not found');
+        const body = JSON.parse(opt.body);
+        (f.kept = f.kept || []).push({ rev: decodeURIComponent(m[2]), content: f.content, keepForever: body.keepForever });
+        return resp(200, { id: m[2], keepForever: body.keepForever });
+      }
       if (p === '/upload/drive/v3/files' && method === 'POST') {
         const type = u.searchParams.get('uploadType');
         if (type === 'multipart') {
           const raw = await bodyText(opt.body);
           const boundary = /boundary=(.+)$/.exec(opt.headers['Content-Type'])[1];
           const parts = raw.split('--' + boundary);
-          const meta = JSON.parse(parts[1].split('\r\n\r\n')[1].trim());
+          const meta = JSON.parse(Buffer.from(parts[1].split('\r\n\r\n')[1].trim(), 'latin1').toString('utf8'));
           const content = parts[2].split('\r\n\r\n').slice(1).join('\r\n\r\n').replace(/\r\n$/, '');
           if (meta.name.startsWith('_index-') && world.crashOnIndexSave && ++world.indexSaves > world.crashAfter) throw new Error('CRASH simulé');
           if (!meta.name.startsWith('_index-')) gd.uploadsCount++;
@@ -174,7 +195,7 @@ function makeWorld() {
         const type = u.searchParams.get('uploadType');
         if (type === 'media') {
           if (f.name.startsWith('_index-') && world.crashOnIndexSave && ++world.indexSaves > world.crashAfter) throw new Error('CRASH simulé');
-          f.content = await bodyText(opt.body); if (!f.name.startsWith('_index-')) gd.uploadsCount++; return resp(200, { id: f.id });
+          f.content = await bodyText(opt.body); f.rev = (f.rev || 0) + 1; if (!f.name.startsWith('_index-')) gd.uploadsCount++; return resp(200, { id: f.id });
         }
         if (type === 'resumable') {
           const sid = 'S' + (++gd.n);
@@ -196,14 +217,14 @@ function makeWorld() {
     if (/\*\//.test(cr)) { const got = s.parts.join('').length; return { status: 308, range: got ? 'bytes=0-' + (got - 1) : null }; }
     const [, a, b, tot] = /bytes (\d+)-(\d+)\/(\d+)/.exec(cr).map(Number);
     assert.strictEqual(a, s.parts.join('').length, 'morceau envoyé au bon décalage');
-    const txt = await blob.text();
+    const txt = Buffer.from(await blob.arrayBuffer()).toString('latin1');
     assert.strictEqual(txt.length, b - a + 1, 'taille du morceau');
     if (b + 1 < tot) assert.strictEqual((b - a + 1) % (256 * 1024), 0, 'morceau multiple de 256 Kio');
     s.parts.push(txt);
     if (b + 1 < tot) return { status: 308, range: 'bytes=0-' + b };
     const content = s.parts.join('');
     gd.uploadsCount++;
-    if (s.existing) { gd.files.get(s.existing).content = content; return { status: 200, json: { id: s.existing } }; }
+    if (s.existing) { const f = gd.files.get(s.existing); f.content = content; f.rev = (f.rev || 0) + 1; return { status: 200, json: { id: s.existing } }; }
     return { status: 200, json: { id: gd.create(s.meta, content) } };
   }
 
@@ -438,9 +459,9 @@ function buildTree(od) {
   // l'index perd ces fichiers (comme une copie interrompue)
   const st = W.engine({ journal: ipad, device: { id: 'IPD', label: 'iPad' }, now: () => clock });
   const idxFile = [...W.gd.files.values()].find((f) => f.name.startsWith('_index-'));
-  const idx = JSON.parse(idxFile.content);
+  const idx = JSON.parse(Buffer.from(idxFile.content, 'latin1').toString('utf8'));
   for (const [k, v] of Object.entries(idx.items)) if (!v.f) delete idx.items[k];
-  idxFile.content = JSON.stringify(idx);
+  idxFile.content = Buffer.from(JSON.stringify(idx), 'utf8').toString('latin1');
   r = await st.run(src, {});
   ok(r.plan.counts.enTropDansGoogle === 0 && r.plan.counts.nouveauxFichiers === 0, 'repris, pas d\'intrus, pas de nouveau fichier');
   ok(r.plan.counts.modifies === ids.size, 'contenu renvoyé une fois par sécurité (' + r.plan.counts.modifies + ')');
@@ -448,6 +469,65 @@ function buildTree(od) {
   sameTree(W, src, mirrorRoot(W), 'après reprise des fichiers v1.4');
   r = await st.run(src, {});
   ok(r.plan.fileOps.length === 0 && r.plan.counts.enTropDansGoogle === 0, 'passage suivant : plus rien à faire');
+
+  console.log('\n17) Fichier corrompu (photo de 135 octets) : JAMAIS copié, signalé');
+  W = makeWorld(); buildTree(W.od);
+  const bad135 = 'x'.repeat(135);
+  W.od.add('CORR', 'S1', 'IMG_3376.jpeg', false, bad135, true);
+  r = await W.engine().run(src, {});
+  const gHas = (name) => [...W.gd.files.values()].some((f) => f.name === name && !f.trashed);
+  ok(!gHas('IMG_3376.jpeg'), 'la photo corrompue n\'a PAS été copiée dans Google');
+  ok(r.suspects.length === 1 && /taille impossible|n'est pas/.test(r.suspects[0].reason), 'elle est signalée : ' + r.suspects[0].reason);
+  r = await W.engine().run(src, {});
+  ok(!gHas('IMG_3376.jpeg') && r.suspects.length === 1, 'au passage suivant : toujours pas copiée, toujours signalée');
+
+  console.log('\n18) Variantes de corruption : vide, coupée, remplie de zéros, remplacée par du texte');
+  const mk = (id, name, raw) => W.od.add(id, 'B1', name, false, raw, true);
+  const good = W.od.items.get('P6').content;
+  mk('C1', 'vide.jpg', '');
+  mk('C2', 'coupee.jpg', good.slice(0, 15000) + ' '.repeat(10000));          // assez lourde mais sans fin d'image
+  mk('C3', 'zeros.jpg', '\0'.repeat(30000));
+  mk('C4', 'texte.jpg', '<html>Erreur 503 : service indisponible</html>' + ' '.repeat(30000));
+  mk('C5', 'coupe.pdf', '%PDF-1.4\n' + ' '.repeat(5000));
+  r = await W.engine().run(src, {});
+  for (const n of ['vide.jpg', 'coupee.jpg', 'zeros.jpg', 'texte.jpg', 'coupe.pdf']) ok(!gHas(n), n + ' non copié — ' + (r.suspects.find((x) => x.path.endsWith(n)) || {}).reason);
+  ok(/texte/.test(r.suspects.find((x) => x.path.endsWith('texte.jpg')).preview), 'le contenu réel est décrit : ' + r.suspects.find((x) => x.path.endsWith('texte.jpg')).preview);
+
+  console.log('\n19) Une bonne photo déjà copiée se corrompt dans OneDrive : la copie Google reste intacte');
+  const before7 = [...W.gd.files.values()].find((f) => f.name === 'photo 7.jpg').content;
+  W.od.setContent('P7', 'y'.repeat(135), true);
+  r = await W.engine().run(src, {});
+  const g7 = [...W.gd.files.values()].find((f) => f.name === 'photo 7.jpg');
+  ok(g7.content === before7, 'copie Google de photo 7 inchangée (bonne version conservée)');
+  ok(r.protectedCount === 1 && r.suspects.some((x) => x.path.endsWith('photo 7.jpg') && x.inGoogle), 'signalée comme corrompue dans OneDrive, copie Google protégée');
+
+  console.log('\n20) Vraie modification : l\'ancienne version Google est conservée pour toujours');
+  const gBail2 = [...W.gd.files.values()].find((f) => f.name === "Bail d'Aurélie.pdf");
+  const oldBail = gBail2.content;
+  W.od.setContent('BAIL', 'bail v9 signé');
+  r = await W.engine().run(src, {});
+  ok(gBail2.kept && gBail2.kept.some((k) => k.keepForever && k.content === oldBail), 'ancienne version marquée « à conserver pour toujours »');
+  ok(gBail2.content === W.od.items.get('BAIL').content, 'nouvelle version en place');
+
+  console.log('\n21) Rapport d\'intégrité (lecture seule) + retrait de Google sur demande');
+  // fichier corrompu copié autrefois (avant la v2.0) : on le simule en le corrompant dans OneDrive sans changer sa version
+  W.od.items.get('P5').content = 'z'.repeat(135);
+  const nGoogle = W.gd.files.size, odCalls = W.od.calls;
+  const e21 = W.engine();
+  const rep1 = await e21.integrity(src, {});
+  ok(W.gd.files.size === nGoogle, 'contrôle rapide : rien écrit dans Google');
+  const names = rep1.suspects.map((x) => x.path.split('/').pop()).sort();
+  ok(['IMG_3376.jpeg', 'photo 5.jpg', 'photo 7.jpg', 'vide.jpg'].every((n) => names.includes(n)), 'contrôle rapide : trouve les fichiers trop petits ou vides (' + names.join(', ') + ')');
+  ok(rep1.suspects.find((x) => x.path.endsWith('photo 5.jpg')).inGoogle === true, 'photo 5 signalée comme présente dans Google');
+  const rep2 = await e21.integrity(src, { deep: true });
+  const names2 = rep2.suspects.map((x) => x.path.split('/').pop()).sort();
+  ok(['coupee.jpg', 'zeros.jpg', 'texte.jpg', 'coupe.pdf'].every((n) => names2.includes(n)), 'contrôle complet : trouve aussi les fichiers coupés ou remplacés (' + names2.length + ' au total)');
+  ok(!names2.includes("Bail d'Aurélie.pdf") && !names2.includes('photo 1 renommée.jpg') && !names2.includes('photo 6.jpg'), 'aucun faux positif sur les bons fichiers');
+  const gP5 = [...W.gd.files.values()].find((f) => f.name === 'photo 5.jpg' && !f.trashed);
+  const n = await e21.removeFromGoogle(src, [rep1.suspects.find((x) => x.path.endsWith('photo 5.jpg')).id]);
+  ok(n === 1 && gP5.trashed, 'retrait sur demande : photo 5 mise à la corbeille Google');
+  r = await W.engine().run(src, {});
+  ok(!gHas('photo 5.jpg') && r.suspects.some((x) => x.path.endsWith('photo 5.jpg')), 'ensuite : photo 5 ni recopiée ni oubliée — toujours signalée');
 
   console.log(`\n✅ ${checks} contrôles réussis`);
 })().catch((e) => { console.error('\n❌ ÉCHEC :', e); process.exit(1); });

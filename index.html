@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- Miroir OneDrive -> Google Drive — index.html — VERSION 1.5 -->
+<!-- Miroir OneDrive -> Google Drive — index.html — VERSION 2.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -35,6 +35,8 @@
   #pBar { height:100%; width:0; background:var(--acc); transition:width .3s; }
   #pCur { white-space:pre-wrap; font-size:13px; color:var(--mut); max-height:70px; overflow:hidden; }
   #summary { white-space:pre-wrap; font-size:15px; background:#f7f9fc; padding:10px; border-radius:10px; margin-top:8px; }
+  .susp { white-space:pre-wrap; font-size:13px; padding:8px 0; border-bottom:1px solid #eee; word-break:break-word; }
+  #iBar { height:100%; width:0; background:#c62828; transition:width .3s; }
   #log { font:12px/1.45 ui-monospace, Menlo, monospace; max-height:240px; overflow:auto; white-space:pre-wrap; }
   details summary { font-weight:600; padding:4px 0; }
   label { display:block; font-size:14px; margin:10px 0 4px; }
@@ -57,7 +59,7 @@
 <body>
 <header><h1>Miroir OneDrive → Google</h1><span id="ver"></span></header>
 
-<div class="card note">OneDrive est seulement <b>lu</b>, jamais modifié. Seule la copie dans Google est corrigée pour être exactement le miroir de OneDrive.</div>
+<div class="card note">OneDrive est seulement <b>lu</b>, jamais modifié. La copie dans Google est tenue à l'image de OneDrive, <b>sauf les fichiers corrompus, qui ne sont jamais copiés</b> : ils sont signalés.</div>
 
 <div class="card">
   <h2>Connexions</h2>
@@ -88,6 +90,21 @@
   </div>
   <div id="summary" hidden></div>
   <p class="muted">Pendant la copie, gardez l'app ouverte et l'écran allumé. Si elle est interrompue, relancez : elle reprend où elle s'était arrêtée.</p>
+</div>
+
+<div class="card">
+  <h2>Intégrité des fichiers OneDrive</h2>
+  <div class="muted">Un fichier corrompu (vide, coupé, de taille impossible…) n'est <b>jamais</b> copié vers Google : il est signalé ici. Rien n'est modifié dans OneDrive.</div>
+  <button class="big" id="iQuick">Contrôle rapide (quelques minutes)</button>
+  <button class="big" id="iDeep">Contrôle complet (lit chaque fichier — long)</button>
+  <div id="iProgress" hidden>
+    <div class="bar"><div id="iBar"></div></div>
+    <div id="iText"></div>
+  </div>
+  <div id="iSummary" style="margin-top:8px;font-weight:600"></div>
+  <div id="iList"></div>
+  <button id="iCopy" hidden style="margin-top:8px">Copier la liste</button>
+  <button id="iRemove" class="stop" hidden style="margin-top:8px"></button>
 </div>
 
 <div class="card">
@@ -138,7 +155,7 @@
   </div>
 </div>
 
-<script src="engine.js?v=1.5"></script>
-<script src="app.js?v=1.3"></script>
+<script src="engine.js?v=2.0"></script>
+<script src="app.js?v=2.0"></script>
 </body>
 </html>

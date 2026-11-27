@@ -1,9 +1,9 @@
 /* Miroir OneDrive -> Google Drive — interface et connexions
- * Fichier : app.js — VERSION 1.3
+ * Fichier : app.js — VERSION 2.0
  */
 (function () {
   'use strict';
-  const APP_VERSION = '1.3';
+  const APP_VERSION = '2.0';
   const DEFAULT_MS_CLIENT = ''; // inscription Entra DÉDIÉE « Miroir », avec la seule permission Files.Read : Microsoft refuse alors toute écriture dans OneDrive
   const MS_AUTH = 'https://login.microsoftonline.com/consumers/oauth2/v2.0';
   const MS_SCOPE = 'Files.Read offline_access';
@@ -41,7 +41,7 @@
   /* ---------------- Outils ---------------- */
   const b64url = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   const rnd = (n) => b64url(crypto.getRandomValues(new Uint8Array(n)));
-  const fmtBytes = (b) => b >= 1e12 ? (b / 1e12).toFixed(2) + ' To' : b >= 1e9 ? (b / 1e9).toFixed(2) + ' Go' : b >= 1e6 ? (b / 1e6).toFixed(1) + ' Mo' : Math.round(b / 1e3) + ' Ko';
+  const fmtBytes = (b) => b >= 1e12 ? (b / 1e12).toFixed(2) + ' To' : b >= 1e9 ? (b / 1e9).toFixed(2) + ' Go' : b >= 1e6 ? (b / 1e6).toFixed(1) + ' Mo' : (b >= 1e3 ? Math.round(b / 1e3) + ' Ko' : b + ' octets');
 
   /* ---------------- Microsoft (code + PKCE, sans librairie) ---------------- */
   async function msLogin() {
@@ -223,6 +223,10 @@
     if (p.phase === 'walk') {
       $('pText').textContent = `Lecture de OneDrive : ${p.folders} dossiers lus, ${p.items} éléments trouvés…`;
       $('pBar').style.width = '5%';
+    } else if (p.phase === 'integrity') {
+      const pct = p.total ? Math.round(100 * p.done / p.total) : 100;
+      $('iBar').style.width = Math.max(3, pct) + '%';
+      $('iText').textContent = `Contrôle : ${p.done} / ${p.total} fichiers lus (${fmtBytes(p.bytesDone)} / ${fmtBytes(p.bytesTotal)}) sur ${p.files} fichiers au total…`;
     } else if (p.phase === 'verify') {
       $('pText').textContent = `Vérification de la copie Google : ${p.folders} dossiers relus, ${p.items} éléments…`;
       $('pBar').style.width = '8%';
@@ -285,6 +289,11 @@
       $('pText').textContent = 'Analyse terminée — rien n\'a été écrit.';
       $('summary').hidden = false; $('summary').textContent = planText(res.plan);
       if (res.walkErrors.length) $('summary').textContent += `\n\n⚠️ ${res.walkErrors.length} dossier(s) illisible(s) : les suppressions ne seraient pas reportées.`;
+      if (res.sizeSuspects && res.sizeSuspects.length) {
+        $('summary').textContent += `\n\n❌ ${res.sizeSuspects.length} fichier(s) déjà repérés comme corrompus (taille impossible) : voir « Intégrité ».`;
+        $('iProgress').hidden = false; $('iText').textContent = 'Repérés pendant l\'analyse :'; $('iBar').style.width = '100%';
+        showSuspects(res.sizeSuspects, 'Fichiers corrompus dans OneDrive (jamais copiés vers Google) :');
+      }
       render(); return;
     }
     if (res.paused === 'google') {
@@ -308,7 +317,70 @@
     if (res.paused === 'annulé') $('pBar').style.width = '0';
     if (res.skipped && res.skipped.length) log(`ℹ️ ${res.skipped.length} élément(s) non copiables ignorés (ex. blocs-notes OneNote) : ` + res.skipped.slice(0, 5).join(', '));
     if (res.plan && !res.paused) set(LS.last, { at: new Date().toISOString(), failed: res.failed.length, counts: res.plan.counts });
+    const corrupt = (res.suspects || []).concat((res.sizeSuspects || []).filter((x) => !(res.suspects || []).some((y) => y.id === x.id)));
+    if (corrupt.length) {
+      $('pText').textContent = $('pText').textContent.replace('✅ Miroir à jour.', '⚠️ Copie terminée, sauf les fichiers corrompus.') + ` — ❌ ${corrupt.length} fichier(s) corrompu(s) NON copié(s) : voir « Intégrité ».`;
+      $('iProgress').hidden = false; $('iText').textContent = 'Repérés pendant la copie :'; $('iBar').style.width = '100%';
+      showSuspects(corrupt.sort((a, b) => a.path.localeCompare(b.path, 'fr')), 'Fichiers corrompus dans OneDrive (jamais copiés vers Google) :');
+    }
     render();
+  }
+
+  /* ---------------- Intégrité ---------------- */
+  let lastSuspects = [];
+  const fmtDate = (d) => d ? new Date(d).toLocaleDateString('fr-BE') : '';
+  function showSuspects(list, title) {
+    const key = 'miroir.suspects.' + (cfg.source ? cfg.source.id : '');
+    const known = new Set(get(key, []));
+    lastSuspects = list;
+    const box = $('iList');
+    box.innerHTML = '';
+    $('iSummary').textContent = title;
+    for (const x of list) {
+      const d = document.createElement('div');
+      d.className = 'susp';
+      d.textContent = (known.has(x.id) ? '' : '🆕 ') + '❌ ' + x.path + '\n   ' + x.reason + ' — ' + fmtBytes(x.size || 0) + (x.mod ? ' — ' + fmtDate(x.mod) : '') +
+        (x.inGoogle ? '\n   ⚠️ une copie existe dans Google' : '') + (x.preview ? '\n   ' + x.preview : '');
+      box.appendChild(d);
+    }
+    set(key, list.map((x) => x.id));
+    const inG = list.filter((x) => x.inGoogle && x.id);
+    $('iRemove').hidden = !inG.length;
+    $('iRemove').textContent = `Retirer de Google les ${inG.length} copie(s) corrompue(s)…`;
+    $('iCopy').hidden = !list.length;
+  }
+  async function runIntegrity(deep) {
+    if (running) return;
+    if (!cfg.source) { alert('Choisissez d\'abord le dossier OneDrive.'); return; }
+    try { await msToken(); } catch (e) { alert(e.message); return; }
+    if (deep && !confirm('Le contrôle complet lit chaque fichier (environ ' + '74 Go pour « Immobilier 2025-2026 »). Il prendra plusieurs heures, écran allumé. Continuer ?')) return;
+    running = true; render(); await keepAwake(true);
+    $('iProgress').hidden = false; $('iBar').style.width = '2%'; $('iText').textContent = 'Lecture de OneDrive…';
+    engine = MiroirEngine.createEngine({ fetch: (u, o) => fetch(u, o), xhrPut, msToken, gToken, gTokenQuiet, log, progress, journal, device: DEVICE });
+    try {
+      const r = await engine.integrity(cfg.source, { deep });
+      $('iBar').style.width = '100%';
+      $('iText').textContent = (r.stopped ? '⏸ Contrôle arrêté. ' : '') + `${deep ? 'Contrôle complet' : 'Contrôle rapide'} : ${r.suspects.length} fichier(s) corrompu(s) sur ${r.total}.` +
+        (r.walkErrors.length ? ` ⚠️ ${r.walkErrors.length} dossier(s) illisible(s).` : '') + (r.googlePaused ? ' (Google non consulté : reconnectez Google pour savoir lesquels y sont copiés.)' : '');
+      showSuspects(r.suspects, r.suspects.length ? 'Fichiers corrompus dans OneDrive (jamais copiés vers Google) :' : '✅ Aucun fichier corrompu trouvé.');
+    } catch (e) { $('iText').textContent = '❌ ' + e.message; log('❌ ' + e.message); }
+    running = false; await keepAwake(false); render();
+  }
+  async function removeCorrupt() {
+    const inG = lastSuspects.filter((x) => x.inGoogle && x.id);
+    if (!inG.length) return;
+    const sample = inG.slice(0, 5).map((x) => '• ' + x.path).join('\n');
+    if (!confirm(`Retirer de Google ces ${inG.length} copie(s) corrompue(s) ?\n\n${sample}${inG.length > 5 ? '\n…' : ''}\n\nElles iront dans la corbeille Google (récupérables 30 jours). OneDrive n'est pas touché.`)) return;
+    if (!gTokenQuiet()) { alert('Reconnectez d\'abord Google (bouton Connecter), puis recommencez.'); return; }
+    running = true; render();
+    engine = MiroirEngine.createEngine({ fetch: (u, o) => fetch(u, o), xhrPut, msToken, gToken, gTokenQuiet, log, progress, journal, device: DEVICE });
+    try {
+      const n = await engine.removeFromGoogle(cfg.source, inG.map((x) => x.id));
+      for (const x of inG) x.inGoogle = false;
+      showSuspects(lastSuspects, $('iSummary').textContent);
+      $('iText').textContent = `🗑️ ${n} copie(s) corrompue(s) retirée(s) de Google (corbeille).`;
+    } catch (e) { $('iText').textContent = '❌ ' + e.message; log('❌ ' + e.message); }
+    running = false; render();
   }
 
   /* ---------------- Affichage ---------------- */
@@ -323,6 +395,7 @@
     const last = get(LS.last, null);
     $('lastRun').textContent = last ? 'Dernière copie complète : ' + new Date(last.at).toLocaleString('fr-BE') + (last.failed ? ` (${last.failed} erreur(s))` : '') : 'Aucune copie terminée pour l\'instant.';
     $('btnRun').disabled = running; $('btnDry').disabled = running;
+    $('iQuick').disabled = running; $('iDeep').disabled = running; $('iRemove').disabled = running;
     $('btnStop').hidden = !running;
     $('msClient').value = cfg.msClient; $('gClient').value = cfg.gClient;
     document.querySelectorAll('input[name=delMode]').forEach((r) => { r.checked = r.value === cfg.delMode; });
@@ -340,6 +413,14 @@
     $('btnRun').onclick = () => start(false, false);
     $('btnDry').onclick = () => start(true, false);
     $('btnStop').onclick = () => { if (engine) { engine.stop(); log('Arrêt demandé : les fichiers en cours se terminent…'); } };
+    $('iQuick').onclick = () => runIntegrity(false);
+    $('iDeep').onclick = () => runIntegrity(true);
+    $('iRemove').onclick = removeCorrupt;
+    $('iCopy').onclick = async () => {
+      const txt = lastSuspects.map((x) => `${x.path} — ${x.reason} — ${fmtBytes(x.size || 0)}${x.mod ? ' — ' + fmtDate(x.mod) : ''}${x.inGoogle ? ' — copie dans Google' : ''}`).join('\n');
+      try { await navigator.clipboard.writeText(txt); $('iCopy').textContent = 'Liste copiée ✓'; setTimeout(() => { $('iCopy').textContent = 'Copier la liste'; }, 2000); }
+      catch (e) { prompt('Liste à copier :', txt); }
+    };
     $('btnSave').onclick = () => {
       cfg.msClient = $('msClient').value.trim(); cfg.gClient = $('gClient').value.trim();
       saveCfg(); render(); log('Réglages enregistrés');

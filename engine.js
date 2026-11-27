@@ -1,5 +1,5 @@
 /* Miroir OneDrive -> Google Drive — moteur de synchronisation
- * Fichier : engine.js — VERSION 1.5
+ * Fichier : engine.js — VERSION 2.0
  * Sens unique : OneDrive (LECTURE SEULE, jamais aucune écriture ni suppression) -> Google Drive.
  * À chaque passage, le miroir Google est relu et remis exactement à l'image de OneDrive.
  * Aucune dépendance externe. Testable hors navigateur (fetch / xhrPut injectés).
@@ -7,7 +7,7 @@
 (function (root) {
   'use strict';
 
-  const ENGINE_VERSION = '1.5';
+  const ENGINE_VERSION = '2.0';
   const GRAPH = 'https://graph.microsoft.com/v1.0';
   const GD = 'https://www.googleapis.com/drive/v3';
   const GU = 'https://www.googleapis.com/upload/drive/v3';
@@ -21,6 +21,87 @@
   const SAVE_EVERY_OPS = 300;   // l'index d'« Immobilier » pèse ~3 Mo : le réécrire tous les 25 fichiers enverrait ~2 Go inutiles
   const SAVE_EVERY_MS = 180000;
   const LOCK_MS = 10 * 60000;                             // un autre appareil actif il y a moins de 10 min = refus
+
+  /* ---------- Contrôle d'intégrité des fichiers ---------- */
+  const EXT_KIND = { jpg: 'jpeg', jpeg: 'jpeg', png: 'png', gif: 'gif', heic: 'heic', heif: 'heic', mov: 'video',
+    mp4: 'video', m4v: 'video', '3gp': 'video', pdf: 'pdf', docx: 'zip', xlsx: 'zip', pptx: 'zip', zip: 'zip', doc: 'ole', xls: 'ole' };
+  // en dessous de ces tailles, un fichier de ce type est anormalement petit (une photo d'iPhone pèse 1 à 5 Mo)
+  const MIN_SIZE = { jpeg: 20480, png: 2048, gif: 512, heic: 20480, video: 10240, pdf: 1024, zip: 2048, ole: 2048 };
+  const KIND_LABEL = { jpeg: 'une photo JPEG', png: 'une image PNG', gif: 'une image GIF', heic: 'une photo HEIC', video: 'une vidéo', pdf: 'un PDF', zip: 'un document Word/Excel', ole: 'un ancien document Word/Excel' };
+  const kindOf = (name) => EXT_KIND[(String(name).split('.').pop() || '').toLowerCase()] || null;
+  const bytesOf = (str) => Array.from(str, (c) => c.charCodeAt(0));
+  function findIn(arr, pat) {
+    outer: for (let i = 0; i <= arr.length - pat.length; i++) {
+      for (let j = 0; j < pat.length; j++) if (arr[i + j] !== pat[j]) continue outer;
+      return i;
+    }
+    return -1;
+  }
+  const startsWith = (arr, pat, off = 0) => pat.every((b, i) => arr[off + i] === b);
+  function preview(arr) {
+    const n = Math.min(arr.length, 120);
+    let printable = 0;
+    for (let i = 0; i < n; i++) { const b = arr[i]; if (b === 9 || b === 10 || b === 13 || (b >= 32 && b < 127) || b >= 160) printable++; }
+    if (n && printable / n > 0.9) {
+      let t = ''; try { t = new TextDecoder('utf-8', { fatal: false }).decode(arr.subarray(0, n)); } catch (e) { t = ''; }
+      return 'contient du texte : « ' + t.replace(/\s+/g, ' ').trim().slice(0, 80) + ' »';
+    }
+    return 'commence par ' + Array.from(arr.subarray(0, Math.min(8, arr.length)), (b) => b.toString(16).padStart(2, '0')).join(' ');
+  }
+  /* Vérifie la structure d'un fichier. Renvoie { ok, level: 'abîmé' | 'à vérifier' | null, reason, preview } */
+  async function checkBlob(name, blob) {
+    const kind = kindOf(name);
+    if (blob.size === 0) return { ok: false, level: 'abîmé', reason: 'fichier vide (0 octet)' };
+    const head = new Uint8Array(await blob.slice(0, Math.min(blob.size, 1024)).arrayBuffer());
+    const tailN = Math.min(blob.size, (kind === 'zip' || kind === 'jpeg') ? 65536 : 8192);
+    const tail = new Uint8Array(await blob.slice(blob.size - tailN).arrayBuffer());
+    const zero = (a) => a.length > 0 && a.every((b) => b === 0);
+    if (zero(head.subarray(0, 64)) && zero(tail.subarray(Math.max(0, tail.length - 64)))) {
+      return { ok: false, level: 'abîmé', reason: 'rempli de zéros', preview: preview(head) };
+    }
+    if (!kind) return { ok: true };
+    const bad = (reason) => ({ ok: false, level: 'abîmé', reason, preview: preview(head) });
+    const label = KIND_LABEL[kind];
+    switch (kind) {
+      case 'jpeg':
+        if (!startsWith(head, [0xFF, 0xD8, 0xFF])) return bad('ce n\'est pas ' + label);
+        if (findIn(tail, [0xFF, 0xD9]) < 0) return bad('photo coupée (la fin de l\'image manque)');
+        break;
+      case 'png':
+        if (!startsWith(head, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])) return bad('ce n\'est pas ' + label);
+        if (findIn(tail, bytesOf('IEND')) < 0) return bad('image coupée (la fin de l\'image manque)');
+        break;
+      case 'gif':
+        if (!startsWith(head, bytesOf('GIF8'))) return bad('ce n\'est pas ' + label);
+        break;
+      case 'heic':
+        if (!startsWith(head, bytesOf('ftyp'), 4)) return bad('ce n\'est pas ' + label);
+        break;
+      case 'video':   // MP4 / MOV : le premier bloc peut être ftyp, mais aussi wide, mdat, moov, free… sur d'anciens fichiers QuickTime
+        if (!['ftyp', 'wide', 'mdat', 'moov', 'free', 'skip', 'pnot'].some((a) => startsWith(head, bytesOf(a), 4))) return bad('ce n\'est pas ' + label);
+        break;
+      case 'pdf':
+        if (findIn(head, bytesOf('%PDF')) < 0) return bad('ce n\'est pas un PDF');
+        if (findIn(tail, bytesOf('%%EOF')) < 0) return bad('PDF coupé (la fin du fichier manque)');
+        break;
+      case 'zip':
+        if (!startsWith(head, [0x50, 0x4B, 0x03, 0x04])) return bad('ce n\'est pas ' + label);
+        if (findIn(tail, [0x50, 0x4B, 0x05, 0x06]) < 0) return bad('document coupé (la fin du fichier manque)');
+        break;
+      case 'ole':
+        if (!startsWith(head, [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])) return bad('ce n\'est pas ' + label);
+        break;
+    }
+    if (blob.size < MIN_SIZE[kind]) return { ok: false, level: 'abîmé', reason: 'taille impossible pour ' + label + ' (' + blob.size + ' octets)', preview: preview(head) };
+    return { ok: true };
+  }
+  /* Repérage sans téléchargement, d'après la taille seule */
+  function suspectBySize(name, size) {
+    if (size === 0) return 'fichier vide (0 octet)';
+    const kind = kindOf(name);
+    if (kind && size < MIN_SIZE[kind]) return 'taille impossible pour ' + KIND_LABEL[kind] + ' (' + size + ' octets)';
+    return null;
+  }
 
   class PauseError extends Error {
     constructor(reason) { super('pause:' + reason); this.pause = reason; }
@@ -129,6 +210,22 @@
       if (remove) url += '&removeParents=' + encodeURIComponent(remove);
       const body = newName !== undefined ? { name: newName } : {};
       await drive(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    }
+
+    /* Avant de remplacer un contenu : l'ancienne version Google est marquée « à conserver pour toujours » */
+    async function keepCurrentVersion(fileId) {
+      try {
+        const f = await drive(GD + '/files/' + encodeURIComponent(fileId) + '?fields=headRevisionId');
+        if (!f.headRevisionId) return false;
+        await drive(GD + '/files/' + encodeURIComponent(fileId) + '/revisions/' + encodeURIComponent(f.headRevisionId) + '?fields=id,keepForever', {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ keepForever: true })
+        });
+        return true;
+      } catch (e) {
+        if (e instanceof PauseError || e.status === 404) throw e;
+        log('⚠️ Ancienne version non marquée « à conserver » (' + e.message + ')');
+        return false;
+      }
     }
 
     /* Envoi d'un contenu : création (meta.parents) ou remplacement (existingId) */
@@ -295,7 +392,7 @@
       const queue = [{ driveId: source.driveId, id: source.id, odId: source.id, path: '' }];
       let idx = 0, running = 0;
       async function listFolder(f) {
-        let url = `/drives/${encodeURIComponent(f.driveId)}/items/${encodeURIComponent(f.id)}/children?$top=200&$select=id,name,size,file,folder,cTag,eTag,remoteItem,package`;
+        let url = `/drives/${encodeURIComponent(f.driveId)}/items/${encodeURIComponent(f.id)}/children?$top=200&$select=id,name,size,file,folder,cTag,eTag,remoteItem,package,lastModifiedDateTime`;
         const local = [];
         while (url) {
           const j = await graph(url);
@@ -310,6 +407,7 @@
               size: isFolder ? 0 : ((ri && ri.size) || it.size || 0),
               tag: isFolder ? '' : ((ri && (ri.cTag || ri.eTag)) || it.cTag || it.eTag || ''),
               path: rel,
+              mod: it.lastModifiedDateTime || (ri && ri.lastModifiedDateTime) || '',
               sha1: isFolder ? '' : sha1FromOd((ri && ri.file) || it.file),
               driveId: (ri && ri.parentReference && ri.parentReference.driveId) || f.driveId,
               realId: (ri && ri.id) || it.id
@@ -472,7 +570,7 @@
     async function run(source, opts = {}) {
       stopRequested = false;
       const t0 = now();
-      const res = { paused: null, done: 0, failed: [], plan: null, skipped: [], walkErrors: [] };
+      const res = { paused: null, done: 0, failed: [], plan: null, skipped: [], walkErrors: [], suspects: [], protectedCount: 0 };
       progress({ phase: 'start' });
       log('Lecture de OneDrive…');
       const w = await walk(source);
@@ -501,6 +599,10 @@
       } catch (e) { if (e instanceof PauseError) { res.paused = e.pause; return res; } throw e; }
       if (stopRequested) { res.paused = 'stop'; return res; }
       const p = plan(w, index);
+      // fichiers corrompus repérés à la taille, y compris ceux déjà copiés autrefois (avant la v2.0)
+      const planned = new Set(p.fileOps.map((o) => o.it.id));
+      res.sizeSuspects = w.items.filter((i) => !i.folder && !planned.has(i.id) && suspectBySize(i.name, i.size))
+        .map((i) => ({ id: i.id, path: i.path, size: i.size, mod: i.mod, reason: suspectBySize(i.name, i.size), inGoogle: !!index.items[i.id] }));
       p.verif = ver.fix;
       p.extras = (w.complete && res.verifyComplete) ? ver.extras : [];
       p.counts.enTropDansGoogle = p.extras.length ? ver.extrasCount : 0;
@@ -579,6 +681,13 @@
               } catch (e) {
                 if (e.status !== 404) throw e;
                 const blob = await download(it);
+                const chk = await checkBlob(it.name, blob);
+                if (!chk.ok) {
+                  res.suspects.push({ id: it.id, path: it.path, size: it.size, mod: it.mod, reason: chk.reason, preview: chk.preview || '', inGoogle: false });
+                  log('❌ CORROMPU, non copié : ' + it.path + ' — ' + chk.reason);
+                  delete index.items[it.id]; journal.add(source.id, { id: it.id, del: true });
+                  continue;
+                }
                 const h = await sha1Of(blob);
                 const g = await gUpload(blob, { name: it.name, parents: [pg], appProperties: { od: it.id, t: String(it.tag).slice(0, 100) } });
                 await record(it.id, { g, p: it.parent, n: it.name, f: 0, t: it.tag, s: it.size, h });
@@ -586,11 +695,24 @@
             } else {
               await gToken(it.size > SMALL ? 900 : 300); // pas de démarrage d'un envoi avec un jeton presque expiré
               const blob = await download(it);
+              const chk = await checkBlob(it.name, blob);
+              if (!chk.ok) {
+                // RÈGLE : un fichier corrompu n'est JAMAIS copié. Il est signalé ; une copie Google existante reste intacte.
+                res.suspects.push({ id: it.id, path: it.path, size: it.size, mod: it.mod, reason: chk.reason, preview: chk.preview || '', inGoogle: !!op.ex });
+                log('❌ CORROMPU, non copié : ' + it.path + ' — ' + chk.reason);
+                if (op.k === 'update' && op.moved) {
+                  await gMove(op.ex.g, pg, it.name);
+                  await record(it.id, Object.assign({}, op.ex, { p: it.parent, n: it.name }));
+                }
+                if (op.ex) { res.protectedCount++; log('🛡️ La copie Google existante est conservée telle quelle : ' + it.path); }
+                continue;
+              }
               const h = await sha1Of(blob);
               let g;
               if (op.k === 'update') {
                 try {
                   if (op.moved) await gMove(op.ex.g, pg, it.name);
+                  if (!String(op.ex.t).startsWith('__')) await keepCurrentVersion(op.ex.g);   // vraie modification dans OneDrive
                   g = await gUpload(blob, null, op.ex.g);
                 } catch (e) {
                   if (e.status !== 404) throw e;
@@ -654,6 +776,80 @@
       return res;
     }
 
+    /* Lecture de l'index sans rien créer dans Google */
+    async function peekIndex(source) {
+      const top = await gFindChild('root', TOP_NAME, true);
+      if (!top) return null;
+      const fileG = await gFindChild(top, '_index-' + source.id + '.json', false);
+      if (!fileG) return null;
+      const r = await drive(GD + '/files/' + encodeURIComponent(fileG) + '?alt=media', {}, 'response');
+      const idx = JSON.parse(await r.text());
+      for (const e of journal.load(source.id) || []) { if (e.root) continue; if (e.del) delete idx.items[e.id]; else idx.items[e.id] = e.rec; }
+      return idx;
+    }
+
+    /* Retire de Google des fichiers corrompus copiés autrefois — UNIQUEMENT sur demande explicite (corbeille Google) */
+    async function removeFromGoogle(source, odIds) {
+      const index = await loadIndex(source);
+      let removed = 0;
+      for (const id of odIds) {
+        const ex = index.items[id];
+        if (!ex || ex.f) continue;
+        try {
+          await drive(GD + '/files/' + encodeURIComponent(ex.g) + '?fields=id', {
+            method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ trashed: true })
+          });
+        } catch (e) { if (e.status !== 404) throw e; }
+        delete index.items[id]; journal.add(source.id, { id, del: true });
+        removed++;
+        log('🗑️ Retiré de Google (corbeille) : ' + id);
+      }
+      await saveIndex(index, source);
+      return removed;
+    }
+
+    /* ---------- Rapport d'intégrité de OneDrive (lecture seule) ---------- */
+    async function integrity(source, opts = {}) {
+      stopRequested = false;
+      const t0 = now();
+      log(opts.deep ? 'Contrôle complet de OneDrive…' : 'Contrôle rapide de OneDrive…');
+      const w = await walk(source);
+      const files = w.items.filter((i) => !i.folder);
+      const out = { suspects: [], checked: 0, total: files.length, walkErrors: w.errors, complete: w.complete, deep: !!opts.deep };
+      // rapide : seulement les fichiers anormalement petits ; complet : tous les fichiers d'un type contrôlable
+      const toCheck = files.filter((f) => opts.deep ? (kindOf(f.name) || f.size === 0) : suspectBySize(f.name, f.size));
+      let i = 0, done = 0, bytes = 0;
+      const totalBytes = toCheck.reduce((a, f) => a + f.size, 0);
+      async function worker() {
+        while (i < toCheck.length && !stopRequested) {
+          const f = toCheck[i++];
+          let r;
+          try {
+            const blob = f.size === 0 ? new Blob([]) : await download(f);
+            r = await checkBlob(f.name, blob);
+            if (!opts.deep && r.ok) { const why = suspectBySize(f.name, f.size); r = { ok: false, level: 'abîmé', reason: why }; }
+          } catch (e) {
+            if (e instanceof PauseError) { stopRequested = true; break; }
+            r = { ok: false, level: 'illisible', reason: 'lecture impossible : ' + e.message };
+          }
+          if (!r.ok) out.suspects.push({ id: f.id, path: f.path, size: f.size, mod: f.mod, level: r.level, reason: r.reason, preview: r.preview || '' });
+          done++; bytes += f.size; out.checked = done;
+          progress({ phase: 'integrity', done, total: toCheck.length, bytesDone: bytes, bytesTotal: totalBytes, files: files.length });
+        }
+      }
+      await Promise.all(Array.from({ length: TRANSFER_PARALLEL }, worker));
+      out.stopped = stopRequested;
+      out.suspects.sort((a, b) => a.path.localeCompare(b.path, 'fr'));
+      try {
+        const idx = await peekIndex(source);
+        for (const s2 of out.suspects) s2.inGoogle = !!(idx && idx.items[s2.id]);
+        out.googleKnown = !!idx;
+      } catch (e) { if (e instanceof PauseError) out.googlePaused = true; else log('⚠️ Copie Google non consultée : ' + e.message); }
+      out.seconds = Math.round((now() - t0) / 1000);
+      log(`Contrôle terminé : ${out.suspects.length} fichier(s) suspect(s) sur ${files.length}.`);
+      return out;
+    }
+
     function descendants(index, id) {
       const kids = {};
       for (const [k, v] of Object.entries(index.items)) (kids[v.p] = kids[v.p] || []).push(k);
@@ -666,13 +862,13 @@
     }
 
     return {
-      run, walk, plan, loadIndex,
+      run, walk, plan, loadIndex, integrity, removeFromGoogle,
       stop() { stopRequested = true; },
       _graph: graph
     };
   }
 
-  const api = { createEngine, PauseError, HttpError, ENGINE_VERSION, TOP_NAME, BIN_NAME };
+  const api = { createEngine, PauseError, HttpError, ENGINE_VERSION, TOP_NAME, BIN_NAME, checkBlob, suspectBySize };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   root.MiroirEngine = api;
 })(typeof self !== 'undefined' ? self : globalThis);
