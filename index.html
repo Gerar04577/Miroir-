@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- Miroir OneDrive -> Google Drive — index.html — VERSION 2.3 -->
+<!-- Miroir OneDrive -> Google Drive — index.html — VERSION 3.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -52,32 +52,34 @@
   .btns { display:flex; gap:8px; }
   .btns button { flex:1; }
   #cText { white-space:pre-wrap; font-size:15px; }
+  .grise { opacity:.45; pointer-events:none; }
   .warn { background:#fff4e5; color:#8a4b00; padding:10px; border-radius:10px; margin:10px 0; }
   .note { background:#eef6ee; color:#1a5c2a; padding:10px; border-radius:10px; font-size:14px; }
 </style>
 </head>
 <body>
 <header><h1>Miroir OneDrive → Google</h1><span id="ver"></span></header>
+<div class="muted" id="who" style="margin:-6px 2px 10px"></div>
 
 <div class="card note">OneDrive est seulement <b>lu</b>, jamais modifié. La copie dans Google est tenue à l'image de OneDrive, <b>sauf les fichiers corrompus, qui ne sont jamais copiés</b> : ils sont signalés.</div>
 
 <div class="card">
   <h2>Connexions</h2>
   <div class="line"><div>Microsoft (OneDrive)<div class="muted" id="msState"></div></div><button id="btnMs">Connecter</button></div>
-  <div class="line"><div>Google Drive<div class="muted" id="gState"></div></div><button id="btnG">Connecter</button></div>
+  <div class="line jm-only"><div>Google Drive<div class="muted" id="gState"></div></div><button id="btnG">Connecter</button></div>
   <div class="muted" id="gQuota"></div>
   <div id="gNeed" class="warn" hidden>Google demande une reconnexion. <button id="gNeedBtn">Reconnecter et reprendre</button></div>
 </div>
 
 <div class="card">
-  <h2>Dossier OneDrive à recopier</h2>
+  <h2 id="srcTitle">Dossier OneDrive à recopier</h2>
   <div class="path" id="srcPath"></div>
   <button id="btnPick" style="margin-top:8px">Choisir le dossier</button>
-  <h2 style="margin-top:14px">Copie dans Google</h2>
-  <div class="path" id="dstPath"></div>
+  <div class="jm-only"><h2 style="margin-top:14px">Copie dans Google</h2>
+  <div class="path" id="dstPath"></div></div>
 </div>
 
-<div class="card">
+<div class="card jm-only">
   <h2>Synchronisation</h2>
   <div class="muted" id="lastRun"></div>
   <button class="big main" id="btnRun">Lancer la copie</button>
@@ -95,6 +97,7 @@
 <div class="card">
   <h2>Intégrité des fichiers OneDrive</h2>
   <div class="muted">Un fichier corrompu (vide, coupé, de taille impossible…) n'est <b>jamais</b> copié vers Google : il est signalé ici. Rien n'est modifié dans OneDrive.</div>
+  <button class="big main" id="iCheck">Check files (Julien) — fichiers envoyés ces dernières 24 h</button>
   <button class="big" id="iQuick">Contrôle rapide (quelques minutes)</button>
   <button class="big" id="iDeep">Contrôle complet (lit chaque fichier — long)</button>
   <div id="iProgress" hidden>
@@ -135,6 +138,16 @@
   </details>
 </div>
 
+<div class="modal" id="userBox" hidden>
+  <div class="sheet">
+    <h2 style="margin:0 0 8px">Bienvenue dans Miroir</h2>
+    <label for="uName">Votre prénom</label>
+    <input type="text" id="uName" autocomplete="given-name" style="font:17px -apple-system,sans-serif">
+    <div class="err" id="uErr" style="margin-top:6px"></div>
+    <button class="big main" id="uGo">Valider</button>
+  </div>
+</div>
+
 <div class="modal" id="picker" hidden>
   <div class="sheet">
     <div class="muted" id="pickPath"></div>
@@ -159,7 +172,7 @@
   </div>
 </div>
 
-<script src="engine.js?v=2.1"></script>
-<script src="app.js?v=2.3"></script>
+<script src="engine.js?v=3.0"></script>
+<script src="app.js?v=3.0"></script>
 </body>
 </html>

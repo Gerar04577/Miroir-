@@ -1,10 +1,11 @@
 /* Miroir OneDrive -> Google Drive — interface et connexions
- * Fichier : app.js — VERSION 2.3
+ * Fichier : app.js — VERSION 3.0
  */
 (function () {
   'use strict';
-  const APP_VERSION = '2.3';
-  const DEFAULT_MS_CLIENT = ''; // inscription Entra DÉDIÉE « Miroir », avec la seule permission Files.Read : Microsoft refuse alors toute écriture dans OneDrive
+  const APP_VERSION = '3.0';
+  const DEFAULT_MS_CLIENT = '94a21be5-6e9c-42ea-b338-0c29fe0e5019'; // inscription Entra DÉDIÉE « Miroir », seule permission Files.Read : Microsoft refuse toute écriture dans OneDrive
+  const DEFAULT_G_CLIENT = '433250610871-8j2bps6kdmvrr5049hekhepjg7eh6dbt.apps.googleusercontent.com'; // projet Google « Miroir » (seul jemagerard@gmail.com est autorisé)
   const MS_AUTH = 'https://login.microsoftonline.com/consumers/oauth2/v2.0';
   const MS_SCOPE = 'Files.Read offline_access';
   const G_SCOPE = 'https://www.googleapis.com/auth/drive'; // accès complet : nécessaire pour VOIR les fichiers ajoutés à la main dans la copie Google (l'app n'agit que dans « Miroir OneDrive »)
@@ -18,7 +19,15 @@
   const set = (k, v) => localStorage.setItem(k, JSON.stringify(v));
   const del = (k) => localStorage.removeItem(k);
 
-  let cfg = Object.assign({ msClient: DEFAULT_MS_CLIENT, gClient: '', source: null, delMode: 'trash' }, get(LS.cfg, {}));
+  let cfg = Object.assign({ msClient: DEFAULT_MS_CLIENT, gClient: DEFAULT_G_CLIENT, source: null, delMode: 'trash' }, get(LS.cfg, {}));
+  if (!cfg.msClient) cfg.msClient = DEFAULT_MS_CLIENT;
+  if (!cfg.gClient) cfg.gClient = DEFAULT_G_CLIENT;
+
+  /* ---------------- Utilisateur (choisi une seule fois, définitif sur l'appareil) ---------------- */
+  const USERS = { jeanmarc: 'Jean-Marc', julien: 'Julien' };
+  let USER = get('miroir.user', null);              // 'Jean-Marc' | 'Julien' | null
+  const isJulien = () => USER === 'Julien';
+  const normName = (t) => String(t || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z]/g, '');
   const saveCfg = () => set(LS.cfg, cfg);
   // Identité de cet appareil (garde-fou : deux appareils ne copient jamais en même temps)
   const ua = navigator.userAgent || '';
@@ -74,6 +83,7 @@
 
   /* ---------------- Google (jeton par redirection, sans librairie) ---------------- */
   function gLogin(silent) {
+    if (isJulien()) return;                        // Julien n'utilise jamais Google
     if (!cfg.gClient) { alert('Indiquez d\'abord l\'identifiant client Google dans les Réglages.'); return; }
     const state = 'g-' + rnd(12);
     set(LS.state, state);
@@ -273,7 +283,7 @@
   }
 
   async function start(dryRun, auto) {
-    if (running) return;
+    if (running || isJulien()) return;
     if (!cfg.source) { alert('Choisissez d\'abord le dossier OneDrive.'); return; }
     try { await msToken(); } catch (e) { alert(e.message); return; }
     if (!gTokenQuiet()) { set(LS.resume, dryRun ? 'dry' : 'run'); gLogin(false); return; }
@@ -364,7 +374,7 @@
     $('iCopy').hidden = !list.length;
   }
   async function runIntegrity(deep) {
-    if (running) return;
+    if (running || isJulien()) return;
     if (!cfg.source) { alert('Choisissez d\'abord le dossier OneDrive.'); return; }
     try { await msToken(); } catch (e) { alert(e.message); return; }
     if (deep && !confirm('Le contrôle complet lit chaque fichier (environ ' + '74 Go pour « Immobilier 2025-2026 »). Il prendra plusieurs heures, écran allumé. Continuer ?')) return;
@@ -382,7 +392,37 @@
     } catch (e) { $('iText').textContent = '❌ ' + e.message; log('❌ ' + e.message); }
     running = false; intMode = false; await keepAwake(false); render();
   }
+  async function checkFiles() {
+    if (running) return;
+    if (!cfg.source) { alert('Choisissez d\'abord le dossier OneDrive (« Immobilier 2025-2026 »).'); return; }
+    try { await msToken(); } catch (e) { alert(e.message); return; }
+    running = true; intMode = true; intT0 = Date.now(); render(); await keepAwake(true);
+    $('iProgress').hidden = false; $('iBar').style.width = '2%'; $('iText').textContent = 'Lecture de OneDrive…';
+    $('iList').innerHTML = ''; $('iSummary').textContent = ''; $('iRemove').hidden = true; $('iCopy').hidden = true; $('rmBox').hidden = true;
+    try { $('iProgress').scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) { /* facultatif */ }
+    engine = MiroirEngine.createEngine({ fetch: (u, o) => fetch(u, o), xhrPut, msToken, gToken: async () => { throw new MiroirEngine.PauseError('google'); }, gTokenQuiet: () => null, log, progress, journal, device: DEVICE });
+    try {
+      const r = await engine.integrity(cfg.source, { sinceMs: Date.now() - 24 * 3600 * 1000 });
+      const bad = r.recent.filter((x) => !x.ok), good = r.recent.filter((x) => x.ok);
+      $('iBar').style.width = '100%';
+      $('iText').textContent = (r.stopped ? '⏸ Contrôle arrêté. ' : '') + `Check files : ${r.recent.length} fichier(s) envoyé(s) ces dernières 24 heures — ✅ ${good.length} intact(s), ❌ ${bad.length} corrompu(s).` +
+        (r.walkErrors.length ? ` ⚠️ ${r.walkErrors.length} dossier(s) illisible(s).` : '');
+      lastSuspects = bad;
+      $('iSummary').textContent = !r.recent.length ? 'Aucun fichier envoyé ces dernières 24 heures.' : bad.length ? '❌ À RENVOYER depuis l\'app Photos (fichiers corrompus) :' : '✅ Tous les fichiers envoyés sont intacts.';
+      const box = $('iList'); box.innerHTML = '';
+      for (const x of r.recent) {
+        const d = document.createElement('div');
+        d.className = 'susp';
+        d.textContent = (x.ok ? '✅ ' : '❌ ') + x.path + '\n   ' + (x.ok ? 'intact' : x.reason) + ' — ' + fmtBytes(x.size || 0) + (x.mod ? ' — ' + new Date(x.mod).toLocaleString('fr-BE') : '');
+        if (!x.ok) d.style.color = '#c62828';
+        box.appendChild(d);
+      }
+      $('iCopy').hidden = !bad.length;
+    } catch (e) { $('iText').textContent = '❌ ' + e.message; log('❌ ' + e.message); }
+    running = false; intMode = false; await keepAwake(false); render();
+  }
   async function removeCorrupt() {
+    if (isJulien()) return;
     const inG = lastSuspects.filter((x) => x.inGoogle && x.id);
     if (!inG.length) return;
     const sample = inG.slice(0, 5).map((x) => '• ' + x.path).join('\n');
@@ -419,8 +459,18 @@
     $('dstPath').textContent = 'Mon Drive › ' + MiroirEngine.TOP_NAME + ' › ' + (cfg.source ? cfg.source.name : '…');
     const last = get(LS.last, null);
     $('lastRun').textContent = last ? 'Dernière copie complète : ' + new Date(last.at).toLocaleString('fr-BE') + (last.failed ? ` (${last.failed} erreur(s))` : '') : 'Aucune copie terminée pour l\'instant.';
-    $('btnRun').disabled = running; $('btnDry').disabled = running;
-    $('iQuick').disabled = running; $('iDeep').disabled = running; $('iRemove').disabled = running;
+    const J = isJulien();
+    $('who').textContent = USER ? 'Utilisateur : ' + USER : '';
+    $('btnRun').disabled = running || J; $('btnDry').disabled = running || J;
+    $('iQuick').disabled = running || J; $('iDeep').disabled = running || J; $('iRemove').disabled = running || J;
+    $('iCheck').disabled = running;
+    $('btnPick').disabled = running;
+    $('btnG').disabled = J; $('gNeedBtn').disabled = J;
+    document.querySelectorAll('.jm-only').forEach((el) => el.classList.toggle('grise', J));
+    ['msClient', 'gClient', 'btnSave', 'btnLogout'].forEach((id) => { $(id).disabled = J; });
+    document.querySelectorAll('input[name=delMode]').forEach((r) => { r.disabled = J; });
+    if (J) $('gState').textContent = '— non utilisé par Julien';
+    $('srcTitle').textContent = J ? 'Dossier OneDrive à contrôler' : 'Dossier OneDrive à recopier';
     $('btnStop').hidden = !running;
     $('msClient').value = cfg.msClient; $('gClient').value = cfg.gClient;
     document.querySelectorAll('input[name=delMode]').forEach((r) => { r.checked = r.value === cfg.delMode; });
@@ -441,6 +491,7 @@
     $('iQuick').onclick = () => runIntegrity(false);
     $('iDeep').onclick = () => runIntegrity(true);
     $('iRemove').onclick = removeCorrupt;
+    $('iCheck').onclick = checkFiles;
     $('iCopy').onclick = async () => {
       const txt = lastSuspects.map((x) => `${x.path} — ${x.reason} — ${fmtBytes(x.size || 0)}${x.mod ? ' — ' + fmtDate(x.mod) : ''}${x.inGoogle ? ' — copie dans Google' : ''}`).join('\n');
       try { await navigator.clipboard.writeText(txt); $('iCopy').textContent = 'Liste copiée ✓'; setTimeout(() => { $('iCopy').textContent = 'Copier la liste'; }, 2000); }
@@ -456,13 +507,28 @@
     window.addEventListener('beforeunload', (e) => { if (running) { e.preventDefault(); e.returnValue = ''; } });
   }
 
+  function askUser() {
+    return new Promise((resolve) => {
+      $('userBox').hidden = false;
+      $('uGo').onclick = () => {
+        const k = normName($('uName').value);
+        const name = USERS[k];
+        if (!name) { $('uErr').textContent = 'Prénom non reconnu. Miroir est réservé à Jean-Marc et à Julien.'; return; }
+        if (!confirm(`Vous êtes ${name} ?\n\nCe choix est définitif sur cet appareil.`)) return;
+        set('miroir.user', name); USER = name;
+        $('userBox').hidden = true; resolve();
+      };
+    });
+  }
+
   window.addEventListener('DOMContentLoaded', async () => {
+    if (!USER) await askUser();
     $('ver').textContent = 'v' + APP_VERSION + ' · moteur v' + MiroirEngine.ENGINE_VERSION;
     bind();
     await handleRedirect();
     render();
     const resume = localStorage.getItem(LS.resume);
-    if (resume && gTokenQuiet() && get(LS.ms, null)) {
+    if (resume && !isJulien() && gTokenQuiet() && get(LS.ms, null)) {
       del(LS.resume);
       start(JSON.parse(resume) === 'dry', JSON.parse(resume) === 'run');
     }

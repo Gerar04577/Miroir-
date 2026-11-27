@@ -25,10 +25,10 @@ function ok(cond, msg) { assert.ok(cond, msg); checks++; console.log('  ✔ ' + 
 class FakeOneDrive {
   constructor() { this.items = new Map(); this.n = 0; this.driveId = 'DRV1'; this.failList = new Set(); this.calls = 0; this.add('ROOT', null, 'root', true); }
   add(id, parent, name, folder, content, raw) {
-    const it = { id, parent, name, folder, content: content == null ? null : (raw ? content : wrap(name, content)), ctag: 'c' + (++this.n) };
+    const it = { id, parent, name, folder, content: content == null ? null : (raw ? content : wrap(name, content)), ctag: 'c' + (++this.n), mod: new Date().toISOString() };
     this.items.set(id, it); return it;
   }
-  setContent(id, c, raw) { const it = this.items.get(id); it.content = raw ? c : wrap(it.name, c); it.ctag = 'c' + (++this.n); }
+  setContent(id, c, raw) { const it = this.items.get(id); it.content = raw ? c : wrap(it.name, c); it.ctag = 'c' + (++this.n); it.mod = new Date().toISOString(); }
   rename(id, name) { this.items.get(id).name = name; }
   move(id, parent) { this.items.get(id).parent = parent; }
   remove(id) { for (const k of this.kids(id)) this.remove(k.id); this.items.delete(id); }
@@ -93,7 +93,7 @@ function makeWorld() {
         const all = od.kids(id);
         const skip = Number(u.searchParams.get('skip') || 0);
         const page = all.slice(skip, skip + world.pageSize).map((k) => {
-          const base = { id: k.id, name: k.name };
+          const base = { id: k.id, name: k.name, lastModifiedDateTime: k.mod };
           if (k.pkg) return Object.assign(base, { package: { type: 'oneNote' } });
           if (k.folder) return Object.assign(base, { folder: { childCount: 0 }, cTag: 'f' + Math.random() });
           return Object.assign(base, { file: {}, size: k.content.length, cTag: k.ctag, eTag: 'e' + k.ctag });
@@ -546,6 +546,20 @@ function buildTree(od) {
   r = await W.engine().run(src, {});
   ok(r.plan.counts.corrompus === 220 && r.plan.counts.nouveauxFichiers === 0 && r.plan.fileOps.length === 0, 'passage suivant : 220 « corrompus, non copiés », 0 nouveau, rien téléchargé');
   ok(r.plan.counts.enTropDansGoogle === 0, 'rien de « en trop »');
+
+  console.log('\n23) Check files (Julien) : fichiers envoyés ces dernières 24 heures');
+  W = makeWorld(); buildTree(W.od);
+  const old = new Date(Date.now() - 3 * 86400000).toISOString();
+  for (const it of W.od.items.values()) it.mod = old;                         // tout ce qui existe date de 3 jours
+  W.od.add('J1', 'S2', 'IMG_9001.jpeg', false, 'photo envoyée ce matin');      // envoyée aujourd'hui, intacte
+  W.od.add('J2', 'S2', 'IMG_9002.jpeg', false, 'bplist00' + 'x'.repeat(127), true);   // envoyée aujourd'hui, corrompue (135 octets)
+  W.od.add('J3', 'S2', 'IMG_9003.jpeg', false, '\xFF\xD8\xFF\xE0' + ' '.repeat(40000), true);  // coupée (pas de fin)
+  const nG = W.gd.files.size;
+  const cf = await W.engine().integrity(src, { sinceMs: Date.now() - 86400000 });
+  ok(cf.recent.length === 3, 'seuls les 3 fichiers des dernières 24 h sont contrôlés (' + cf.recent.length + ' sur ' + cf.total + ')');
+  ok(cf.recent.filter((x) => x.ok).length === 1 && cf.recent.find((x) => x.ok).path.endsWith('IMG_9001.jpeg'), 'IMG_9001 : ✅ intacte');
+  ok(cf.suspects.length === 2 && cf.recent[0].ok === false, 'IMG_9002 et IMG_9003 : ❌ corrompues, listées en premier');
+  ok(W.gd.files.size === nG, 'rien n\'est écrit dans Google');
 
   console.log(`\n✅ ${checks} contrôles réussis`);
 })().catch((e) => { console.error('\n❌ ÉCHEC :', e); process.exit(1); });

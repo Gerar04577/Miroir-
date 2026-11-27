@@ -1,5 +1,5 @@
 /* Miroir OneDrive -> Google Drive — moteur de synchronisation
- * Fichier : engine.js — VERSION 2.1
+ * Fichier : engine.js — VERSION 3.0
  * Sens unique : OneDrive (LECTURE SEULE, jamais aucune écriture ni suppression) -> Google Drive.
  * À chaque passage, le miroir Google est relu et remis exactement à l'image de OneDrive.
  * Aucune dépendance externe. Testable hors navigateur (fetch / xhrPut injectés).
@@ -7,7 +7,7 @@
 (function (root) {
   'use strict';
 
-  const ENGINE_VERSION = '2.1';
+  const ENGINE_VERSION = '3.0';
   const GRAPH = 'https://graph.microsoft.com/v1.0';
   const GD = 'https://www.googleapis.com/drive/v3';
   const GU = 'https://www.googleapis.com/upload/drive/v3';
@@ -832,8 +832,13 @@
       const w = await walk(source);
       const files = w.items.filter((i) => !i.folder);
       const out = { suspects: [], checked: 0, total: files.length, walkErrors: w.errors, complete: w.complete, deep: !!opts.deep };
+      // Check files : tous les fichiers envoyés/modifiés depuis opts.sinceMs, lus en entier ;
       // rapide : seulement les fichiers anormalement petits ; complet : tous les fichiers d'un type contrôlable
-      const toCheck = files.filter((f) => opts.deep ? (kindOf(f.name) || f.size === 0) : suspectBySize(f.name, f.size));
+      const recentMode = typeof opts.sinceMs === 'number';
+      if (recentMode) opts.deep = true;
+      const toCheck = files.filter((f) => recentMode ? (Date.parse(f.mod) >= opts.sinceMs)
+        : opts.deep ? (kindOf(f.name) || f.size === 0) : suspectBySize(f.name, f.size));
+      out.recent = recentMode ? [] : null;
       let i = 0, done = 0, bytes = 0;
       const totalBytes = toCheck.reduce((a, f) => a + f.size, 0);
       async function worker() {
@@ -849,6 +854,7 @@
             r = { ok: false, level: 'illisible', reason: 'lecture impossible : ' + e.message };
           }
           if (!r.ok) out.suspects.push({ id: f.id, path: f.path, size: f.size, mod: f.mod, level: r.level, reason: r.reason, preview: r.preview || '' });
+          if (out.recent) out.recent.push({ id: f.id, path: f.path, size: f.size, mod: f.mod, ok: !!r.ok, reason: r.ok ? '' : r.reason });
           done++; bytes += f.size; out.checked = done;
           progress({ phase: 'integrity', done, total: toCheck.length, bytesDone: bytes, bytesTotal: totalBytes, files: files.length });
         }
@@ -856,6 +862,7 @@
       await Promise.all(Array.from({ length: TRANSFER_PARALLEL }, worker));
       out.stopped = stopRequested;
       out.suspects.sort((a, b) => a.path.localeCompare(b.path, 'fr'));
+      if (out.recent) out.recent.sort((a, b) => (a.ok - b.ok) || a.path.localeCompare(b.path, 'fr'));
       try {
         const idx = await peekIndex(source);
         for (const s2 of out.suspects) s2.inGoogle = !!(idx && idx.items[s2.id]);
