@@ -1,9 +1,9 @@
 /* Miroir OneDrive -> Google Drive — interface et connexions
- * Fichier : app.js — VERSION 2.2
+ * Fichier : app.js — VERSION 2.3
  */
 (function () {
   'use strict';
-  const APP_VERSION = '2.2';
+  const APP_VERSION = '2.3';
   const DEFAULT_MS_CLIENT = ''; // inscription Entra DÉDIÉE « Miroir », avec la seule permission Files.Read : Microsoft refuse alors toute écriture dans OneDrive
   const MS_AUTH = 'https://login.microsoftonline.com/consumers/oauth2/v2.0';
   const MS_SCOPE = 'Files.Read offline_access';
@@ -231,9 +231,11 @@
       $('pText').textContent = `Lecture de OneDrive : ${p.folders} dossiers lus, ${p.items} éléments trouvés…`;
       $('pBar').style.width = '5%';
     } else if (p.phase === 'remove') {
-      $('iProgress').hidden = false;
-      $('iBar').style.width = (p.total ? Math.max(3, Math.round(100 * p.done / p.total)) : 3) + '%';
-      $('iText').textContent = p.done ? `Retrait de Google : ${p.done} / ${p.total}… (${elapsed()})` : 'Lecture de la liste Google… (' + elapsed() + ')';
+      const pct = p.total ? Math.max(3, Math.round(100 * p.done / p.total)) : 3;
+      const txt = p.done ? `Retrait de Google : ${p.done} / ${p.total}… (${elapsed()})` : 'Préparation du retrait… (' + elapsed() + ')';
+      $('iProgress').hidden = false; $('iBar').style.width = pct + '%'; $('iText').textContent = txt;
+      $('rmBox').hidden = false; $('rmBar').style.width = pct + '%'; $('rmText').textContent = txt;
+      $('iRemove').textContent = p.done ? `⏳ Retrait en cours : ${p.done} / ${p.total}` : '⏳ Retrait en cours…';
     } else if (p.phase === 'integrity') {
       const pct = p.total ? Math.round(100 * p.done / p.total) : 100;
       $('iBar').style.width = Math.max(3, pct) + '%';
@@ -368,6 +370,8 @@
     if (deep && !confirm('Le contrôle complet lit chaque fichier (environ ' + '74 Go pour « Immobilier 2025-2026 »). Il prendra plusieurs heures, écran allumé. Continuer ?')) return;
     running = true; intMode = true; intT0 = Date.now(); render(); await keepAwake(true);
     $('iProgress').hidden = false; $('iBar').style.width = '2%'; $('iText').textContent = 'Lecture de OneDrive…';
+    $('iList').innerHTML = ''; $('iSummary').textContent = ''; $('iRemove').hidden = true; $('iCopy').hidden = true; $('rmBox').hidden = true;
+    try { $('iProgress').scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) { /* facultatif */ }
     engine = MiroirEngine.createEngine({ fetch: (u, o) => fetch(u, o), xhrPut, msToken, gToken, gTokenQuiet, log, progress, journal, device: DEVICE });
     try {
       const r = await engine.integrity(cfg.source, { deep });
@@ -385,6 +389,8 @@
     if (!confirm(`Retirer de Google ces ${inG.length} copie(s) corrompue(s) ?\n\n${sample}${inG.length > 5 ? '\n…' : ''}\n\nElles iront dans la corbeille Google (récupérables 30 jours). OneDrive n'est pas touché.`)) return;
     if (!gTokenQuiet()) { alert('Reconnectez d\'abord Google (bouton Connecter), puis recommencez.'); return; }
     running = true; intMode = true; intT0 = Date.now(); render();
+    $('rmBox').hidden = false; $('rmBar').style.width = '3%'; $('rmText').textContent = 'Préparation du retrait…';
+    $('iRemove').textContent = '⏳ Retrait en cours…';
     engine = MiroirEngine.createEngine({ fetch: (u, o) => fetch(u, o), xhrPut, msToken, gToken, gTokenQuiet, log, progress, journal, device: DEVICE });
     try {
       const r = await engine.removeFromGoogle(cfg.source, inG.map((x) => x.id));
@@ -393,8 +399,10 @@
       showSuspects(lastSuspects, $('iSummary').textContent);
       $('iBar').style.width = '100%';
       $('iText').textContent = `🗑️ ${r.removed} copie(s) corrompue(s) retirée(s) de Google (corbeille).` + (r.failed.length ? ` ❌ ${r.failed.length} échec(s) : voir le Journal, puis réessayez.` : '');
+      $('rmBar').style.width = '100%'; $('rmText').textContent = '✅ Terminé — ' + $('iText').textContent;
     } catch (e) {
       $('iText').textContent = e instanceof MiroirEngine.PauseError ? '⏸ Connexion Google expirée : touchez « Connecter » (Google), puis recommencez. Ce qui est fait reste fait.' : '❌ ' + e.message;
+      $('rmText').textContent = $('iText').textContent;
       log('❌ ' + e.message);
     }
     running = false; intMode = false; render();
